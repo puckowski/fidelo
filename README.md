@@ -1,4 +1,6 @@
-# MusicGen
+# Fidelo
+
+Music generation project.
 
 ## Training
 
