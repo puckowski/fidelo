@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Large/generated data
+prepared/
+model_out/
+generated*.wav
+latent_generated_*.wav
+latent_blend_*.wav
+waveform_generated_*.wav
+reconstruction_test_out/
+wordcloud_word_frequencies.json
+wordcloud_word_frequencies.csv
+
+# Dataset artifacts
+# Keep metadata, ignore audio payloads by default
+dataset/audio/
+
+# Training outputs
+latent_audio_tokenizer_out/
+latent_audio_prior_out/
+waveform_model_out/
+
+# Checkpoints
+*.pt
+*.pth
+*.ckpt
+best_*.pt
+
+# Analysis / temp outputs
+*.npy
+*.npz
+*.wav
+*.tmp
+*.bak
+
+# Notebook checkpoints
+.ipynb_checkpoints/
