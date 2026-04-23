@@ -188,8 +188,11 @@ So in practice:
 A simple way to think about the whole system:
 
 - **Tokenizer** = learns a compact alphabet of sound pieces
+  - latent_audio_token_pipeline.py and train_latent_audio_tokenizer.py
 - **Prior** = learns how to arrange those pieces from text
+  - latent_audio_token_pipeline.py and train_latent_audio_prior.py
 - **Decoder** = turns those arranged pieces back into audio
+  - latent_audio_token_pipeline.py and used at inference in generate_latent_audio_cuda.py
 
 Or even shorter:
 
