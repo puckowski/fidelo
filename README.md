@@ -11,6 +11,8 @@ python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out 
 
 python .\blend_prompt_matched_latents.py --prompt "studio with a guitar and drums" --num-sources 2 --duration-seconds 30 --window-steps 512 --overlap-steps 16 --seed 998762
 
+python .\blend_prompt_matched_latents_diverse.py --prompt "tags century of aeroplanes, phizmiz amp margita" --num-sources 2 --duration-seconds 30 --window-steps 512 --overlap-steps 16 --seed 56798 --max-source-seconds 10
+
 # Latent Music Generation Architecture
 
 This project uses a **two-stage music generation system**.

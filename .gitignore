@@ -61,6 +61,8 @@ best_*.pt
 *.npy
 *.npz
 *.wav
+!latent_blend_20260502_064314_5bed7855.wav
+!latent_blend_diverse_20260506_163925_0956c05f.wav
 *.tmp
 *.bak
 
