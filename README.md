@@ -6,12 +6,15 @@ Music generation project.
 
 python .\train_latent_audio_tokenizer.py --epochs 20  
 python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --epochs 20      
+python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
 
 ## Inference
 
-python .\blend_prompt_matched_latents.py --prompt "studio with a guitar and drums" --num-sources 2 --duration-seconds 30 --window-steps 512 --overlap-steps 16 --seed 998762
+python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade.py --prompt "instrumental pop" --seed 88 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 12 --min-window-rms 0.012 --min-window-peak 0.04 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024  --theme-repeat-bonus 3.5
 
-python .\blend_prompt_matched_latents_diverse.py --prompt "tags century of aeroplanes, phizmiz amp margita" --num-sources 2 --duration-seconds 30 --window-steps 512 --overlap-steps 16 --seed 56798 --max-source-seconds 10
+## Model V2
+
+After right-sizing the context length, model V2 is on average 5.36% less static-filled, the median is 10.43% less static-filled, and the audio collapses to silence 27.87% less often reducing the dependency on inference energy gate.
 
 # Latent Music Generation Architecture
 
