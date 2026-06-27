@@ -12,7 +12,7 @@ import generate_latent_audio_cuda_source_creative_ranked_energy_gate as energy_g
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate prompt-conditioned audio with fixed-duration source themes, rank-relaxed token sampling, and energy gates for windows and clips, with sticky source selection and crossfaded theme changes."
+        description="Generate prompt-conditioned audio with fixed-duration source themes, rank-relaxed token sampling, energy gates, and a simple intro/body/outro song structure."
     )
     parser.add_argument("--tokenizer-dir", default="latent_audio_tokenizer_out")
     parser.add_argument("--prior-dir", default="latent_audio_prior_out")
@@ -58,6 +58,24 @@ def parse_args():
     parser.add_argument("--theme-repeat-bonus", type=float, default=2.0, help="How strongly to prefer a source file that appeared recently.")
     parser.add_argument("--theme-repeat-decay", type=float, default=0.6, help="How quickly repeat preference decays for older entries in the sliding window.")
     parser.add_argument("--theme-crossfade-ms", type=int, default=180, help="Crossfade length used when stitching decoded theme segments together.")
+    parser.add_argument("--intro-ratio", type=float, default=0.2, help="Approximate fraction of clips reserved for the intro section.")
+    parser.add_argument("--outro-ratio", type=float, default=0.2, help="Approximate fraction of clips reserved for the outro section.")
+    parser.add_argument("--intro-theme-top-n", type=int, default=1, help="Limit intro themes to the strongest prompt match pool for a more stable opening.")
+    parser.add_argument("--outro-theme-top-n", type=int, default=1, help="Limit outro themes to a tight pool so the ending resolves more clearly.")
+    parser.add_argument("--intro-theme-seconds", type=float, default=2.5, help="Keep intro themes active longer to establish a clearer opening idea.")
+    parser.add_argument("--outro-theme-seconds", type=float, default=2.8, help="Keep outro themes active longer to avoid a restless ending.")
+    parser.add_argument("--intro-theme-temperature", type=float, default=0.35, help="Lower intro theme temperature for a more deliberate opening.")
+    parser.add_argument("--outro-theme-temperature", type=float, default=0.3, help="Lower outro theme temperature for a more deliberate ending.")
+    parser.add_argument("--intro-repeat-bonus", type=float, default=5.0, help="Bias the intro toward repeating the opening theme.")
+    parser.add_argument("--outro-repeat-bonus", type=float, default=6.0, help="Bias the outro toward reusing a stable closing theme.")
+    parser.add_argument("--intro-source-strength", type=float, default=0.92, help="Use stronger source anchoring in the intro.")
+    parser.add_argument("--outro-source-strength", type=float, default=0.95, help="Use stronger source anchoring in the outro.")
+    parser.add_argument("--intro-creative-token-mix", type=float, default=0.08, help="Reduce free-form token mixing in the intro.")
+    parser.add_argument("--outro-creative-token-mix", type=float, default=0.05, help="Reduce free-form token mixing in the outro.")
+    parser.add_argument("--intro-rank-choice-prob", type=float, default=0.12, help="Lower non-top-token sampling in the intro.")
+    parser.add_argument("--outro-rank-choice-prob", type=float, default=0.08, help="Lower non-top-token sampling in the outro.")
+    parser.add_argument("--song-intro-fade-ms", type=int, default=220, help="Apply a short fade-in to the final song output.")
+    parser.add_argument("--song-outro-fade-ms", type=int, default=1800, help="Apply a longer fade-out to the final song output.")
     parser.add_argument("--creative-span-count", type=int, default=5, help="How many prior-driven spans to inject per window.")
     parser.add_argument("--creative-span-min", type=int, default=8)
     parser.add_argument("--creative-span-max", type=int, default=40)
@@ -103,6 +121,95 @@ def clip_has_sufficient_loudness(chunk_energies: List[Dict[str, float]], args) -
         return True
     loudness = summarize_clip_loudness(chunk_energies)
     return loudness["median_rms"] >= min_clip_median_rms
+
+
+def clamp_ratio(value: float) -> float:
+    return max(0.0, min(0.45, float(value)))
+
+
+def build_song_sections(clip_count: int, args) -> List[str]:
+    if clip_count <= 0:
+        return []
+    if clip_count == 1:
+        return ["body"]
+    if clip_count == 2:
+        return ["intro", "outro"]
+
+    intro_count = max(1, int(round(clip_count * clamp_ratio(args.intro_ratio))))
+    outro_count = max(1, int(round(clip_count * clamp_ratio(args.outro_ratio))))
+    while intro_count + outro_count > clip_count - 1:
+        if outro_count >= intro_count and outro_count > 1:
+            outro_count -= 1
+        elif intro_count > 1:
+            intro_count -= 1
+        else:
+            break
+
+    sections: List[str] = []
+    for clip_idx in range(clip_count):
+        if clip_idx < intro_count:
+            sections.append("intro")
+        elif clip_idx >= clip_count - outro_count:
+            sections.append("outro")
+        else:
+            sections.append("body")
+    return sections
+
+
+def build_section_args(args, section_name: str):
+    clip_args = argparse.Namespace(**vars(args))
+    if section_name == "intro":
+        clip_args.theme_top_n = max(1, int(args.intro_theme_top_n))
+        clip_args.theme_seconds = max(0.1, float(args.intro_theme_seconds))
+        clip_args.theme_temperature = max(1e-6, float(args.intro_theme_temperature))
+        clip_args.theme_repeat_bonus = max(0.0, float(args.intro_repeat_bonus))
+        clip_args.source_strength = max(0.0, min(1.0, float(args.intro_source_strength)))
+        clip_args.creative_token_mix = max(0.0, min(1.0, float(args.intro_creative_token_mix)))
+        clip_args.rank_choice_prob = max(0.0, min(1.0, float(args.intro_rank_choice_prob)))
+    elif section_name == "outro":
+        clip_args.theme_top_n = max(1, int(args.outro_theme_top_n))
+        clip_args.theme_seconds = max(0.1, float(args.outro_theme_seconds))
+        clip_args.theme_temperature = max(1e-6, float(args.outro_theme_temperature))
+        clip_args.theme_repeat_bonus = max(0.0, float(args.outro_repeat_bonus))
+        clip_args.source_strength = max(0.0, min(1.0, float(args.outro_source_strength)))
+        clip_args.creative_token_mix = max(0.0, min(1.0, float(args.outro_creative_token_mix)))
+        clip_args.rank_choice_prob = max(0.0, min(1.0, float(args.outro_rank_choice_prob)))
+    return clip_args
+
+
+def build_section_candidate_entries(candidate_entries: List[Dict], anchor_entry: Optional[Dict], section_name: str, args) -> List[Dict]:
+    if section_name == "intro":
+        return candidate_entries[:max(1, int(args.intro_theme_top_n))]
+    if section_name == "outro":
+        if anchor_entry is None:
+            return candidate_entries[:max(1, int(args.outro_theme_top_n))]
+        limited = [anchor_entry]
+        for entry in candidate_entries:
+            if entry.get("file") == anchor_entry.get("file"):
+                continue
+            limited.append(entry)
+            if len(limited) >= max(1, int(args.outro_theme_top_n)):
+                break
+        return limited
+    return candidate_entries
+
+
+def apply_song_endcaps(audio: torch.Tensor, sample_rate: int, intro_fade_ms: int, outro_fade_ms: int) -> torch.Tensor:
+    shaped = audio.clone()
+    total_samples = shaped.shape[-1]
+    if total_samples <= 1:
+        return shaped
+
+    intro_samples = min(total_samples, max(0, int(sample_rate * max(0, intro_fade_ms) / 1000)))
+    outro_samples = min(total_samples, max(0, int(sample_rate * max(0, outro_fade_ms) / 1000)))
+
+    if intro_samples > 1:
+        intro_curve = torch.sin(torch.linspace(0.0, math.pi / 2.0, intro_samples, device=shaped.device))
+        shaped[..., :intro_samples] = shaped[..., :intro_samples] * intro_curve
+    if outro_samples > 1:
+        outro_curve = torch.cos(torch.linspace(0.0, math.pi / 2.0, outro_samples, device=shaped.device))
+        shaped[..., -outro_samples:] = shaped[..., -outro_samples:] * outro_curve
+    return shaped
 
 
 def choose_theme_entry(
@@ -500,14 +607,24 @@ def main():
     for entry in candidate_entries:
         print(f"- {entry['file']} | score={entry['match_score']:.2f} | {entry['text']}")
 
+    section_names = build_song_sections(clip_count, args)
+    anchor_entry = candidate_entries[0] if candidate_entries else None
+    if anchor_entry is not None:
+        print(f"Structural anchor theme: {anchor_entry['file']}")
+
     clips = []
     for clip_idx in range(clip_count):
-        print(f"Generating sticky crossfaded source-creative latent clip {clip_idx + 1}/{clip_count} on {device}...")
+        section_name = section_names[clip_idx] if clip_idx < len(section_names) else "body"
+        section_entries = build_section_candidate_entries(candidate_entries, anchor_entry, section_name, args)
+        print(
+            f"Generating {section_name} sticky crossfaded source-creative latent clip "
+            f"{clip_idx + 1}/{clip_count} on {device}..."
+        )
         accepted_waveform = None
         retry_count = max(1, int(args.clip_retry_count))
 
         for retry_idx in range(retry_count):
-            clip_args = argparse.Namespace(**vars(args))
+            clip_args = build_section_args(args, section_name)
             clip_args.seed = args.seed + clip_idx * 1009 + retry_idx * 7919
             codes, segment_ranges = generate_source_creative_ranked_codes(
                 clip_args,
@@ -516,7 +633,7 @@ def main():
                 text_tokens,
                 text_mask,
                 prior_config,
-                candidate_entries,
+                section_entries,
                 device,
                 source_rng,
             )
@@ -546,6 +663,7 @@ def main():
                     print(f"Accepted clip {clip_idx + 1} after {retry_idx + 1} attempts")
                 print(
                     f"Added clip {clip_idx + 1} to output "
+                    f"section={section_name} "
                     f"quietest_chunk_rms={quietest_accepted_chunk['rms']:.4f} "
                     f"quietest_chunk_peak={quietest_accepted_chunk['peak']:.4f} "
                     f"median_chunk_rms={loudness_summary['median_rms']:.4f}"
@@ -556,19 +674,19 @@ def main():
             if not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args):
                 print(
                     "Rejected low-energy clip "
-                    f"{clip_idx + 1} attempt {retry_idx + 1}/{retry_count} "
+                    f"{clip_idx + 1} section={section_name} attempt {retry_idx + 1}/{retry_count} "
                     f"worst_chunk_rms={worst_chunk['rms']:.4f} worst_chunk_peak={worst_chunk['peak']:.4f}"
                 )
             else:
                 print(
                     "Rejected low-loudness clip "
-                    f"{clip_idx + 1} attempt {retry_idx + 1}/{retry_count} "
+                    f"{clip_idx + 1} section={section_name} attempt {retry_idx + 1}/{retry_count} "
                     f"median_chunk_rms={loudness_summary['median_rms']:.4f} "
                     f"mean_chunk_rms={loudness_summary['mean_rms']:.4f}"
                 )
 
         if accepted_waveform is None:
-            print(f"Skipping clip {clip_idx + 1} after {retry_count} failed energy checks")
+            print(f"Skipping clip {clip_idx + 1} section={section_name} after {retry_count} failed energy checks")
             continue
 
         clips.append(accepted_waveform)
@@ -595,6 +713,8 @@ def main():
         peak = output.abs().max().item()
         if peak > 0.98:
             output = output * (0.98 / peak)
+
+    output = apply_song_endcaps(output, tokenizer_config.sample_rate, args.song_intro_fade_ms, args.song_outro_fade_ms)
 
     output_path = args.output or make_output_name(args.prompt)
     base.save_audio_waveform(output_path, output, tokenizer_config.sample_rate)

@@ -12,9 +12,23 @@ python .\train_latent_audio_tokenizer.py --clip-seconds 3.33
 
 python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade.py --prompt "instrumental pop" --seed 88 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 12 --min-window-rms 0.012 --min-window-peak 0.04 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024  --theme-repeat-bonus 3.5
 
+python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade.py --prompt "synth pop" --seed 1200 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 32 --min-window-rms 0.16 --min-window-peak 0.55 --clip-energy-check-seconds 0.75 --min-clip-rms 0.14 --min-clip-peak 0.45 --min-clip-median-rms 0.3 --clip-retry-count 24 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024 --theme-repeat-bonus 3.5  
+
 ## Model V2
 
-After right-sizing the context length, model V2 is on average 5.36% less static-filled, the median is 10.43% less static-filled, and the audio collapses to silence 27.87% less often reducing the dependency on inference energy gate.
+After right-sizing the context length, model V2 quality improved.
+
+|Evaluation|Model V1|Model V2|Improvement|
+|-------------|----------------|----------------|------------------|
+|Static average|1.2138|1.1482|5.36% less static|
+|Static median|1.4004|1.2539 |10.43% less static|
+|Silence|61 quiet rejects|44 quiet rejects|27.87% fewer rejects|
+
+## Dataset Preparation
+
+Started with a 10,000 sample subset from a larger Free Music Archive audio clip and description dataset.
+
+Used local Gemma 4, Ollama and OpenCode to create Python script that uses Gemma4 as a judge of dataset audio descriptions to filter out rows where a person is speaking, talking, narrating, giving dialogue, being interviewed, making a speech, conversation, podcast, announcement, commentary, or other spoken words.
 
 # Latent Music Generation Architecture
 
