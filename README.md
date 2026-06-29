@@ -14,6 +14,8 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
 
 python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade.py --prompt "synth pop" --seed 1200 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 32 --min-window-rms 0.16 --min-window-peak 0.55 --clip-energy-check-seconds 0.75 --min-clip-rms 0.14 --min-clip-peak 0.45 --min-clip-median-rms 0.3 --clip-retry-count 24 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024 --theme-repeat-bonus 3.5  
 
+python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured.py --prompt "classic rock" --seed 2 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 12 --min-window-rms 0.012 --min-window-peak 0.04 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024 --theme-repeat-bonus 3.5 --intro-ratio 0.2 --outro-ratio 0.2 --intro-theme-top-n 1 --outro-theme-top-n 1 --intro-theme-seconds 2.8 --outro-theme-seconds 3.2 --intro-repeat-bonus 6.0 --outro-repeat-bonus 7.0 --song-intro-fade-ms 220 --song-outro-fade-ms 2200
+
 ## Model V2
 
 After right-sizing the context length, model V2 quality improved.
@@ -28,7 +30,7 @@ After right-sizing the context length, model V2 quality improved.
 
 Started with a 10,000 sample subset from a larger Free Music Archive audio clip and description dataset.
 
-Used local Gemma 4, Ollama and OpenCode to create Python script that uses Gemma4 as a judge of dataset audio descriptions to filter out rows where a person is speaking, talking, narrating, giving dialogue, being interviewed, making a speech, conversation, podcast, announcement, commentary, or other spoken words.
+Used local Gemma 4, Ollama and OpenCode to create Python script that uses Gemma 4 as a judge of dataset audio descriptions to filter out rows where a person is speaking, talking, narrating, giving dialogue, being interviewed, making a speech, conversation, podcast, announcement, commentary, or other spoken words.
 
 # Latent Music Generation Architecture
 
