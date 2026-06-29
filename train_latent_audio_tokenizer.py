@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 import random
@@ -12,8 +13,10 @@ from latent_audio_token_pipeline import (
     AudioTextDataset,
     LatentAudioConfig,
     VQAudioAutoencoder,
+    load_audio_tokenizer_bundle,
     load_dataset_items,
     safe_audio_collate,
+    safe_torch_load,
     save_audio_tokenizer_bundle,
 )
 
@@ -32,7 +35,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-ratio", type=float, default=0.02)
-    parser.add_argument("--codebook-size", type=int, default=2048)
+    parser.add_argument("--codebook-size", type=int, default=4096)
     parser.add_argument("--code-dim", type=int, default=384)
     parser.add_argument("--commitment-cost", type=float, default=0.1)
     parser.add_argument("--encoder-channels", type=int, nargs="*", default=[128, 256, 512])
@@ -40,7 +43,7 @@ def parse_args():
     parser.add_argument("--residual-layers-per-stage", type=int, default=2)
     parser.add_argument("--bottleneck-layers", type=int, default=4)
     parser.add_argument("--quantizer-pre-layers", type=int, default=2)
-    parser.add_argument("--quantizer-post-layers", type=int, default=2)
+    parser.add_argument("--quantizer-post-layers", type=int, default=3)
     parser.add_argument("--max-text-tokens", type=int, default=40)
     parser.add_argument("--text-embed-dim", type=int, default=256)
     parser.add_argument("--prior-hidden-size", type=int, default=768)
@@ -50,6 +53,7 @@ def parse_args():
     parser.add_argument("--vq-weight", type=float, default=1.0)
     parser.add_argument("--stft-weight", type=float, default=0.35)
     parser.add_argument("--grad-accum-steps", type=int, default=2)
+    parser.add_argument("--finetune-from", default="", help="Directory containing a saved tokenizer bundle, or a specific tokenizer checkpoint file, to continue training from.")
     parser.add_argument("--random-crop", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -107,6 +111,31 @@ def get_device(allow_cpu: bool) -> torch.device:
     raise RuntimeError("CUDA is required for this tokenizer training script. Re-run with --allow-cpu to override.")
 
 
+def load_tokenizer_for_finetuning(path: str, device: torch.device):
+    if os.path.isdir(path):
+        model, config = load_audio_tokenizer_bundle(path, device)
+        return model.train(), config, path
+
+    checkpoint_path = path
+    if not os.path.isfile(checkpoint_path):
+        raise RuntimeError(f"Fine-tune path does not exist: {checkpoint_path}")
+
+    model_dir = os.path.dirname(checkpoint_path) or "."
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.isfile(config_path):
+        raise RuntimeError(
+            f"Could not find config.json next to tokenizer checkpoint: {checkpoint_path}"
+        )
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = LatentAudioConfig.from_dict(json.load(f))
+    model = VQAudioAutoencoder(config)
+    state = safe_torch_load(checkpoint_path, device)
+    model.load_state_dict(state)
+    model.to(device).train()
+    return model, config, checkpoint_path
+
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
@@ -137,26 +166,38 @@ def main():
     device = get_device(args.allow_cpu)
     print(f"Tokenizer training device: {device}")
 
-    config = LatentAudioConfig(
-        sample_rate=args.sample_rate,
-        clip_seconds=args.clip_seconds,
-        codebook_size=args.codebook_size,
-        code_dim=args.code_dim,
-        commitment_cost=args.commitment_cost,
-        residual_layers_per_stage=args.residual_layers_per_stage,
-        bottleneck_layers=args.bottleneck_layers,
-        quantizer_pre_layers=args.quantizer_pre_layers,
-        quantizer_post_layers=args.quantizer_post_layers,
-        max_text_tokens=args.max_text_tokens,
-        text_embed_dim=args.text_embed_dim,
-        prior_hidden_size=args.prior_hidden_size,
-        prior_num_layers=args.prior_num_layers,
-        prior_dropout=args.prior_dropout,
-        encoder_channels=list(args.encoder_channels),
-        encoder_strides=list(args.encoder_strides),
-        metadata_csv=args.metadata_csv,
-        audio_dir=args.audio_dir,
-    )
+    if args.finetune_from:
+        model, config, resolved_finetune_path = load_tokenizer_for_finetuning(args.finetune_from, device)
+        print(f"Fine-tuning tokenizer from {resolved_finetune_path}")
+        print(
+            "Using saved tokenizer config: "
+            f"sample_rate={config.sample_rate}, clip_seconds={config.clip_seconds}, "
+            f"codebook_size={config.codebook_size}, code_dim={config.code_dim}"
+        )
+        config.metadata_csv = args.metadata_csv
+        config.audio_dir = args.audio_dir
+    else:
+        config = LatentAudioConfig(
+            sample_rate=args.sample_rate,
+            clip_seconds=args.clip_seconds,
+            codebook_size=args.codebook_size,
+            code_dim=args.code_dim,
+            commitment_cost=args.commitment_cost,
+            residual_layers_per_stage=args.residual_layers_per_stage,
+            bottleneck_layers=args.bottleneck_layers,
+            quantizer_pre_layers=args.quantizer_pre_layers,
+            quantizer_post_layers=args.quantizer_post_layers,
+            max_text_tokens=args.max_text_tokens,
+            text_embed_dim=args.text_embed_dim,
+            prior_hidden_size=args.prior_hidden_size,
+            prior_num_layers=args.prior_num_layers,
+            prior_dropout=args.prior_dropout,
+            encoder_channels=list(args.encoder_channels),
+            encoder_strides=list(args.encoder_strides),
+            metadata_csv=args.metadata_csv,
+            audio_dir=args.audio_dir,
+        )
+        model = VQAudioAutoencoder(config).to(device)
 
     items = load_dataset_items(args.metadata_csv, args.audio_dir)
     if not items:
@@ -191,7 +232,6 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
-    model = VQAudioAutoencoder(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
