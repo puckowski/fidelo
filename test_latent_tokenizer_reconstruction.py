@@ -21,6 +21,12 @@ def parse_args():
     parser.add_argument("--metadata-csv", default="dataset/metadata.csv")
     parser.add_argument("--audio-dir", default="dataset/audio")
     parser.add_argument("--output-dir", default="reconstruction_test_out")
+    parser.add_argument(
+        "--output-seconds",
+        type=float,
+        default=0.0,
+        help="Optional positive clip length override in seconds. Uses tokenizer training clip length when omitted or <= 0.",
+    )
     parser.add_argument("--random-sample", action="store_true", help="Pick a random training file when --input-audio is not provided.")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--allow-cpu", action="store_true")
@@ -59,14 +65,17 @@ def main():
 
     tokenizer_model, config = load_audio_tokenizer_bundle(args.tokenizer_dir, device)
     input_audio = choose_input_audio(args)
+    target_samples = config.clip_samples
+    if args.output_seconds > 0:
+        target_samples = max(1, int(round(args.output_seconds * config.sample_rate)))
 
     waveform = load_audio_mono(input_audio, config.sample_rate)
-    waveform = crop_or_pad(waveform, config.clip_samples, random_crop=False)
+    waveform = crop_or_pad(waveform, target_samples, random_crop=False)
     waveform_batch = waveform.unsqueeze(0).to(device)
 
     with torch.no_grad():
         codes = tokenizer_model.encode_codes(waveform_batch)
-        reconstructed = tokenizer_model.decode_codes(codes, target_length=config.clip_samples).squeeze(0).cpu()
+        reconstructed = tokenizer_model.decode_codes(codes, target_length=target_samples).squeeze(0).cpu()
 
     os.makedirs(args.output_dir, exist_ok=True)
     stem = Path(input_audio).stem
