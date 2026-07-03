@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--audio-dir", default="dataset/audio")
     parser.add_argument("--out-dir", default="latent_audio_tokenizer_out")
     parser.add_argument("--sample-rate", type=int, default=44100)
-    parser.add_argument("--clip-seconds", type=float, default=5.0)
+    parser.add_argument("--clip-seconds", type=float, default=3.33)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--lr", type=float, default=2e-4)
