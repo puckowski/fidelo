@@ -23,12 +23,12 @@ class LatentAudioConfig:
     encoder_channels: Sequence[int] = field(default_factory=lambda: [128, 256, 512])
     encoder_strides: Sequence[int] = field(default_factory=lambda: [4, 4, 2])
     code_dim: int = 384
-    codebook_size: int = 2048
+    codebook_size: int = 4096
     commitment_cost: float = 0.1
     residual_layers_per_stage: int = 3
     bottleneck_layers: int = 4
     quantizer_pre_layers: int = 2
-    quantizer_post_layers: int = 2
+    quantizer_post_layers: int = 3
     max_text_tokens: int = 40
     text_embed_dim: int = 256
     prior_hidden_size: int = 768
