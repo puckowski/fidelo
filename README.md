@@ -18,10 +18,10 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
 
 python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured.py `
   --prompt "genre Classical; styles Classical" `
-  --seed 100 `
+  --seed 1001 `
   --duration-seconds 30 `
   --source-strength 0.85 `
-  --top-k 2 `
+  --top-k 4 `
   --top-p 0.95 `
   --rank-choice-top 2 `
   --window-energy-check-top 12 `
@@ -62,7 +62,13 @@ Fine tune with 5 second context.
 
 Fine tune with 4 gradient accumulation steps, 5 second context, and decreased 5e-5 learning rate.
 
-Model V3 reconstructs audio 1.43% more fiathfully than Model V2.
+Model V3 reconstructs audio 1.43% more faithfully than Model V2.
+
+## Model V4
+
+Fine tune with lower weight decay, higher commitment cost, 4 gradient accumulation steps, and 5e-5 learning rate.
+
+Model V4 reconstructs audio 1.69% more faithfully than Model V3.
 
 ## Dataset Preparation
 
