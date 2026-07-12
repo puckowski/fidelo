@@ -54,6 +54,7 @@ ALLOW_CPU="${ALLOW_CPU:-0}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 EXTRA_TEST_ARGS="${EXTRA_TEST_ARGS:-}"
 TRAIN_FAILURE_STREAK=0
+COMPILE_FAILURE_STREAK=0
 STASH_HELPER="$REPO_ROOT/scripts/stash_repo_changes.py"
 
 if ! command -v opencode >/dev/null 2>&1; then
@@ -193,6 +194,36 @@ stash_repo_changes_after_failures() {
     --message "$reason_message"
 }
 
+compile_changed_python_files() {
+  local log_path="$1"
+  local -a tracked_python_files=()
+  local -a untracked_python_files=()
+  local -a python_files=()
+  local file_path
+
+  mapfile -t tracked_python_files < <(git diff --name-only --diff-filter=ACM -- '*.py' || true)
+  mapfile -t untracked_python_files < <(git ls-files --others --exclude-standard -- '*.py' || true)
+
+  for file_path in "${tracked_python_files[@]}" "${untracked_python_files[@]}"; do
+    if [ -z "$file_path" ]; then
+      continue
+    fi
+    if [ ! -f "$file_path" ]; then
+      continue
+    fi
+    python_files+=("$file_path")
+  done
+
+  if [ ${#python_files[@]} -eq 0 ]; then
+    echo "No changed Python files to compile." | tee "$log_path"
+    return 0
+  fi
+
+  printf 'Compiling changed Python files:\n' | tee "$log_path"
+  printf ' - %s\n' "${python_files[@]}" | tee -a "$log_path"
+  "$PYTHON_CMD" -m py_compile "${python_files[@]}" 2>&1 | tee -a "$log_path"
+}
+
 for ((iteration = 1; iteration <= ITERATIONS; iteration++)); do
   ITER_LABEL="$(printf '%03d' "$iteration")"
   ITER_DIR="$RUN_DIR/iteration_$ITER_LABEL"
@@ -201,6 +232,7 @@ for ((iteration = 1; iteration <= ITERATIONS; iteration++)); do
   PROMPT_FILE="$ITER_DIR/opencode_prompt.txt"
   STATUS_FILE="$ITER_DIR/git_status_after_agent.txt"
   DIFF_FILE="$ITER_DIR/git_diff_after_agent.patch"
+  COMPILE_LOG="$ITER_DIR/compile.log"
   TRAIN_LOG="$ITER_DIR/train.log"
   RECON_LOG="$ITER_DIR/reconstruction.log"
   ITER_TOKENIZER_DIR="$ITER_DIR/tokenizer_out"
@@ -249,6 +281,24 @@ EOF
 
   git status --short > "$STATUS_FILE" || true
   git diff --binary > "$DIFF_FILE" || true
+
+  if ! compile_changed_python_files "$COMPILE_LOG"; then
+    COMPILE_FAILURE_STREAK=$((COMPILE_FAILURE_STREAK + 1))
+    NOTE="python compile check failed"
+    if [ "$COMPILE_FAILURE_STREAK" -ge 2 ]; then
+      STASH_MESSAGE="Auto stash after two consecutive Python compile failures at iteration $ITER_LABEL"
+      if stash_repo_changes_after_failures "$ITER_LABEL" "$STASH_MESSAGE" | tee -a "$COMPILE_LOG"; then
+        NOTE="python compile check failed; stashed code changes after two consecutive compile failures"
+      else
+        NOTE="python compile check failed; attempted stash after two consecutive compile failures but stash command failed"
+      fi
+      COMPILE_FAILURE_STREAK=0
+    fi
+    append_report_block "Iteration $ITER_LABEL" "$BEST_TOKENIZER_DIR" "$COMPILE_LOG" "$COMPILE_LOG" "$BEST_MAE" "$BEST_MSE" "no" "$NOTE"
+    continue
+  fi
+
+  COMPILE_FAILURE_STREAK=0
 
   TRAIN_CMD=(
     "$PYTHON_CMD" "./train_latent_audio_tokenizer.py"
