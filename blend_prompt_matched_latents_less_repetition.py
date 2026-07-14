@@ -109,7 +109,7 @@ def encode_source_codes(
 
 @torch.no_grad()
 def lookup_quantized_window(tokenizer_model, codes: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return tokenizer_model.quantizer.lookup(codes.unsqueeze(0).to(device))
+    return tokenizer_model.lookup_codes(codes.unsqueeze(0).to(device))
 
 
 def choose_sources(

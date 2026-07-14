@@ -13,8 +13,8 @@ from latent_audio_token_pipeline import (
     AudioTextDataset,
     LatentAudioConfig,
     VQAudioAutoencoder,
-    load_audio_tokenizer_bundle,
     load_dataset_items,
+    load_tokenizer_state_dict,
     safe_audio_collate,
     safe_torch_load,
     save_audio_tokenizer_bundle,
@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument("--val-ratio", type=float, default=0.02)
     parser.add_argument("--codebook-size", type=int, default=4096)
     parser.add_argument("--code-dim", type=int, default=384)
+    parser.add_argument("--num-quantizers", type=int, default=0)
     parser.add_argument("--commitment-cost", type=float, default=0.1)
     parser.add_argument("--encoder-channels", type=int, nargs="*", default=[128, 256, 512])
     parser.add_argument("--encoder-strides", type=int, nargs="*", default=[4, 4, 2])
@@ -54,6 +55,7 @@ def parse_args():
     parser.add_argument("--stft-weight", type=float, default=0.35)
     parser.add_argument("--grad-accum-steps", type=int, default=2)
     parser.add_argument("--finetune-from", default="", help="Directory containing a saved tokenizer bundle, or a specific tokenizer checkpoint file, to continue training from.")
+    parser.add_argument("--residual-finetune-warmup-epochs", type=int, default=0)
     parser.add_argument("--random-crop", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -111,17 +113,21 @@ def get_device(allow_cpu: bool) -> torch.device:
     raise RuntimeError("CUDA is required for this tokenizer training script. Re-run with --allow-cpu to override.")
 
 
-def load_tokenizer_for_finetuning(path: str, device: torch.device):
+def load_tokenizer_for_finetuning(path: str, device: torch.device, num_quantizers_override: int = 0):
     if os.path.isdir(path):
-        model, config = load_audio_tokenizer_bundle(path, device)
-        return model.train(), config, path
+        model_dir = path
+        checkpoint_path = os.path.join(model_dir, "best_audio_tokenizer.pt")
+        if not os.path.isfile(checkpoint_path):
+            checkpoint_path = os.path.join(model_dir, "audio_tokenizer.pt")
+        config_path = os.path.join(model_dir, "config.json")
+    else:
+        checkpoint_path = path
+        if not os.path.isfile(checkpoint_path):
+            raise RuntimeError(f"Fine-tune path does not exist: {checkpoint_path}")
 
-    checkpoint_path = path
-    if not os.path.isfile(checkpoint_path):
-        raise RuntimeError(f"Fine-tune path does not exist: {checkpoint_path}")
+        model_dir = os.path.dirname(checkpoint_path) or "."
+        config_path = os.path.join(model_dir, "config.json")
 
-    model_dir = os.path.dirname(checkpoint_path) or "."
-    config_path = os.path.join(model_dir, "config.json")
     if not os.path.isfile(config_path):
         raise RuntimeError(
             f"Could not find config.json next to tokenizer checkpoint: {checkpoint_path}"
@@ -129,11 +135,29 @@ def load_tokenizer_for_finetuning(path: str, device: torch.device):
 
     with open(config_path, "r", encoding="utf-8") as f:
         config = LatentAudioConfig.from_dict(json.load(f))
+    source_num_quantizers = max(1, int(config.num_quantizers))
+    if num_quantizers_override > 0:
+        config.num_quantizers = max(1, int(num_quantizers_override))
+
     model = VQAudioAutoencoder(config)
     state = safe_torch_load(checkpoint_path, device)
-    model.load_state_dict(state)
+    load_tokenizer_state_dict(model, state)
     model.to(device).train()
-    return model, config, checkpoint_path
+    return model, config, checkpoint_path, source_num_quantizers
+
+
+def set_module_requires_grad(module: torch.nn.Module, enabled: bool):
+    for param in module.parameters():
+        param.requires_grad = enabled
+
+
+def configure_residual_finetune_warmup(model: VQAudioAutoencoder, source_num_quantizers: int, enabled: bool):
+    set_module_requires_grad(model.encoder, not enabled)
+    set_module_requires_grad(model.pre_quant, not enabled)
+    for quantizer_idx, quantizer in enumerate(model.quantizers):
+        set_module_requires_grad(quantizer, (not enabled) or quantizer_idx >= source_num_quantizers)
+    set_module_requires_grad(model.post_quant, True)
+    set_module_requires_grad(model.decoder, True)
 
 
 @torch.no_grad()
@@ -165,14 +189,20 @@ def main():
     set_seed(args.seed)
     device = get_device(args.allow_cpu)
     print(f"Tokenizer training device: {device}")
+    source_num_quantizers = 0
 
     if args.finetune_from:
-        model, config, resolved_finetune_path = load_tokenizer_for_finetuning(args.finetune_from, device)
+        model, config, resolved_finetune_path, source_num_quantizers = load_tokenizer_for_finetuning(
+            args.finetune_from,
+            device,
+            num_quantizers_override=args.num_quantizers,
+        )
         print(f"Fine-tuning tokenizer from {resolved_finetune_path}")
         print(
             "Using saved tokenizer config: "
             f"sample_rate={config.sample_rate}, clip_seconds={config.clip_seconds}, "
-            f"codebook_size={config.codebook_size}, code_dim={config.code_dim}"
+            f"codebook_size={config.codebook_size}, code_dim={config.code_dim}, "
+            f"num_quantizers={config.num_quantizers}"
         )
         config.metadata_csv = args.metadata_csv
         config.audio_dir = args.audio_dir
@@ -182,6 +212,7 @@ def main():
             clip_seconds=args.clip_seconds,
             codebook_size=args.codebook_size,
             code_dim=args.code_dim,
+            num_quantizers=max(1, args.num_quantizers),
             commitment_cost=args.commitment_cost,
             residual_layers_per_stage=args.residual_layers_per_stage,
             bottleneck_layers=args.bottleneck_layers,
@@ -198,6 +229,8 @@ def main():
             audio_dir=args.audio_dir,
         )
         model = VQAudioAutoencoder(config).to(device)
+
+    print(f"Tokenizer quantizers: {config.num_quantizers}")
 
     items = load_dataset_items(args.metadata_csv, args.audio_dir)
     if not items:
@@ -240,6 +273,13 @@ def main():
 
     for epoch in range(args.epochs):
         model.train()
+        use_residual_warmup = (
+            args.finetune_from
+            and args.residual_finetune_warmup_epochs > 0
+            and config.num_quantizers > source_num_quantizers
+            and epoch < args.residual_finetune_warmup_epochs
+        )
+        configure_residual_finetune_warmup(model, source_num_quantizers, enabled=bool(use_residual_warmup))
         running_recon = 0.0
         running_vq = 0.0
         running_stft = 0.0
@@ -291,7 +331,8 @@ def main():
         print(
             f"epoch {epoch + 1}: train_recon={running_recon / max(1, steps):.4f} "
             f"train_stft={running_stft / max(1, steps):.4f} train_vq={running_vq / max(1, steps):.4f} "
-            f"val_recon={val_recon:.4f} val_stft={val_stft:.4f} val_vq={val_vq:.4f}"
+            f"val_recon={val_recon:.4f} val_stft={val_stft:.4f} val_vq={val_vq:.4f} "
+            f"warmup={'on' if use_residual_warmup else 'off'}"
         )
 
         save_audio_tokenizer_bundle(args.out_dir, model, config)

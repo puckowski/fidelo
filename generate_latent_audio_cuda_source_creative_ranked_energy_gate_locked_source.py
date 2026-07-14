@@ -30,6 +30,12 @@ fuse_source_and_proposal_window = energy_gate.fuse_source_and_proposal_window
 measure_window_energy = energy_gate.measure_window_energy
 measure_audio_chunk_energies = energy_gate.measure_audio_chunk_energies
 clip_has_sufficient_energy = energy_gate.clip_has_sufficient_energy
+code_step_count = base.code_step_count
+empty_code_sequence = base.empty_code_sequence
+extract_code_tail = base.extract_code_tail
+ensure_batched_codes = base.ensure_batched_codes
+concat_code_sequences = base.concat_code_sequences
+slice_code_steps = base.slice_code_steps
 select_source_window_with_energy_gate = energy_gate.select_source_window_with_energy_gate
 
 
@@ -54,30 +60,30 @@ def generate_source_creative_ranked_codes(
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
-    generated = torch.empty(0, dtype=torch.long)
+    generated = empty_code_sequence(getattr(prior_model, "num_quantizers", 1))
     rng = energy_gate.random.Random(args.seed)
     first_selected_entry: Optional[Dict] = None
 
-    while generated.shape[0] < total_steps:
+    while code_step_count(generated) < total_steps:
         prefix_codes = None
         prefix_len = 0
-        if overlap_size > 0 and generated.shape[0] > 0:
-            prefix_codes = generated[-overlap_size:]
-            prefix_len = prefix_codes.shape[0]
+        if overlap_size > 0 and code_step_count(generated) > 0:
+            prefix_codes = extract_code_tail(generated, overlap_size)
+            prefix_len = code_step_count(prefix_codes)
 
-        new_steps = min(window_size if prefix_len == 0 else (window_size - prefix_len), total_steps - generated.shape[0])
+        new_steps = min(window_size if prefix_len == 0 else (window_size - prefix_len), total_steps - code_step_count(generated))
         generated_new = generate_rank_relaxed_window(
             args,
             prior_model,
             text_tokens,
             text_mask,
             new_steps,
-            prefix_codes=(None if prefix_codes is None else prefix_codes.unsqueeze(0)),
+            prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
             device=device,
             rng=rng,
         ).squeeze(0).cpu()
 
-        proposal_full = generated_new if prefix_codes is None else torch.cat([prefix_codes.cpu(), generated_new], dim=0)
+        proposal_full = generated_new if prefix_codes is None else concat_code_sequences(prefix_codes.cpu(), generated_new)
         candidates = find_source_window_candidates(
             proposal_full,
             prefix_codes,
@@ -106,11 +112,11 @@ def generate_source_creative_ranked_codes(
                 args,
                 rng,
             )
-            chosen_new = fused_window[prefix_len:prefix_len + new_steps]
+            chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
         else:
             chosen_new = generated_new
 
-        generated = torch.cat([generated, chosen_new], dim=0)
+        generated = concat_code_sequences(generated, chosen_new)
 
     return generated.unsqueeze(0).to(device), first_selected_entry
 
@@ -146,6 +152,7 @@ def main():
         device,
         args.source_candidates,
         args.max_source_seconds,
+        target_num_quantizers=getattr(prior_model, "num_quantizers", 1),
     )
     if not candidate_entries:
         raise RuntimeError("No source candidates found for source-creative generation.")

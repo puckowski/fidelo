@@ -95,18 +95,60 @@ def score_prompt_match(prompt: str, text: str) -> float:
     return contains_bonus + overlap + (overlap / max(1, len(prompt_set)))
 
 
+def code_step_count(codes: torch.Tensor) -> int:
+    return int(codes.shape[-1])
+
+
+def empty_code_sequence(num_quantizers: int) -> torch.Tensor:
+    if num_quantizers > 1:
+        return torch.empty((num_quantizers, 0), dtype=torch.long)
+    return torch.empty(0, dtype=torch.long)
+
+
+def slice_code_steps(codes: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    return codes[..., start:end]
+
+
+def concat_code_sequences(*parts: torch.Tensor) -> torch.Tensor:
+    valid_parts = [part for part in parts if part is not None and part.numel() > 0]
+    if not valid_parts:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(valid_parts, dim=-1)
+
+
+def extract_code_tail(codes: torch.Tensor, length: int) -> torch.Tensor:
+    if length <= 0:
+        return codes[..., :0]
+    return codes[..., -length:]
+
+
+def ensure_batched_codes(codes: torch.Tensor) -> torch.Tensor:
+    return codes.unsqueeze(0)
+
+
 @torch.no_grad()
 def encode_source_codes(item: Dict[str, str], tokenizer_model, config, device: torch.device, max_source_seconds: float) -> torch.Tensor:
     waveform = load_audio_mono(item["path"], config.sample_rate)
     if max_source_seconds > 0:
         max_samples = int(round(max_source_seconds * config.sample_rate))
         waveform = waveform[..., :max_samples]
-    codes = tokenizer_model.encode_codes(waveform.unsqueeze(0).to(device))
+    codes = tokenizer_model.encode_codes(
+        waveform.unsqueeze(0).to(device),
+        return_all_codes=(getattr(tokenizer_model.config, "num_quantizers", 1) > 1),
+    )
     return codes.squeeze(0).cpu()
 
 
 @torch.no_grad()
-def build_source_entries(prompt: str, tokenizer_model, config, device: torch.device, limit: int, max_source_seconds: float) -> List[Dict]:
+def build_source_entries(
+    prompt: str,
+    tokenizer_model,
+    config,
+    device: torch.device,
+    limit: int,
+    max_source_seconds: float,
+    target_num_quantizers: Optional[int] = None,
+) -> List[Dict]:
     if limit <= 0:
         return []
 
@@ -128,6 +170,8 @@ def build_source_entries(prompt: str, tokenizer_model, config, device: torch.dev
     for score, item in chosen:
         try:
             codes = encode_source_codes(item, tokenizer_model, config, device, max_source_seconds)
+            if target_num_quantizers == 1 and codes.dim() == 2:
+                codes = codes[0]
             if codes.numel() == 0:
                 continue
             entries.append(
@@ -155,22 +199,22 @@ def find_source_window_candidates(
     scan_step_divisor: int,
 ) -> List[Dict]:
     proposal_full = proposal_full.cpu()
-    prefix_len = 0 if prefix_codes is None else min(overlap_size, prefix_codes.shape[0])
-    prefix_tail = None if prefix_codes is None else prefix_codes[-prefix_len:].cpu()
-    window_size = proposal_full.shape[0]
+    prefix_len = 0 if prefix_codes is None else min(overlap_size, code_step_count(prefix_codes))
+    prefix_tail = None if prefix_codes is None else extract_code_tail(prefix_codes, prefix_len).cpu()
+    window_size = code_step_count(proposal_full)
     step = max(1, window_size // max(1, scan_step_divisor))
     candidates: List[Dict] = []
 
     for entry in candidate_entries:
         seq = entry["codes"]
-        if seq.shape[0] < window_size:
+        if code_step_count(seq) < window_size:
             continue
-        for start in range(0, seq.shape[0] - window_size + 1, step):
-            window = seq[start:start + window_size]
-            proposal_match = (window == proposal_full[:window_size]).float().mean().item()
+        for start in range(0, code_step_count(seq) - window_size + 1, step):
+            window = slice_code_steps(seq, start, start + window_size)
+            proposal_match = (window == slice_code_steps(proposal_full, 0, window_size)).float().mean().item()
             continuity = 0.0
             if prefix_tail is not None and prefix_len > 0:
-                continuity = (window[:prefix_len] == prefix_tail).float().mean().item()
+                continuity = (slice_code_steps(window, 0, prefix_len) == prefix_tail).float().mean().item()
             score = (
                 (continuity_weight * continuity)
                 + (proposal_weight * proposal_match)
@@ -211,17 +255,31 @@ def choose_source_window_creatively(candidates: List[Dict], top_n: int, temperat
 def apply_repetition_penalty(logits: torch.Tensor, history: List[torch.Tensor], repetition_penalty: float, repetition_window: int) -> torch.Tensor:
     if repetition_penalty <= 1.0 or not history:
         return logits
-    recent = torch.cat(history[-max(1, repetition_window):], dim=1)
     adjusted_logits = logits.clone()
+    if logits.dim() == 2:
+        recent = torch.cat(history[-max(1, repetition_window):], dim=1)
+        for batch_idx in range(recent.shape[0]):
+            unique_tokens = torch.unique(recent[batch_idx])
+            token_logits = adjusted_logits[batch_idx, unique_tokens]
+            adjusted = torch.where(
+                token_logits >= 0,
+                token_logits / repetition_penalty,
+                token_logits * repetition_penalty,
+            )
+            adjusted_logits[batch_idx, unique_tokens] = adjusted
+        return adjusted_logits
+
+    recent = torch.stack(history[-max(1, repetition_window):], dim=-1)
     for batch_idx in range(recent.shape[0]):
-        unique_tokens = torch.unique(recent[batch_idx])
-        token_logits = adjusted_logits[batch_idx, unique_tokens]
-        adjusted = torch.where(
-            token_logits >= 0,
-            token_logits / repetition_penalty,
-            token_logits * repetition_penalty,
-        )
-        adjusted_logits[batch_idx, unique_tokens] = adjusted
+        for quantizer_idx in range(recent.shape[1]):
+            unique_tokens = torch.unique(recent[batch_idx, quantizer_idx])
+            token_logits = adjusted_logits[batch_idx, quantizer_idx, unique_tokens]
+            adjusted = torch.where(
+                token_logits >= 0,
+                token_logits / repetition_penalty,
+                token_logits * repetition_penalty,
+            )
+            adjusted_logits[batch_idx, quantizer_idx, unique_tokens] = adjusted
     return adjusted_logits
 
 
@@ -243,6 +301,13 @@ def filter_logits(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tenso
 
 
 def sample_rank_relaxed_next_code(logits: torch.Tensor, args, rng: random.Random) -> torch.Tensor:
+    if logits.dim() == 3:
+        next_codes = []
+        for quantizer_idx in range(logits.shape[1]):
+            sampled = sample_rank_relaxed_next_code(logits[:, quantizer_idx, :], args, rng)
+            next_codes.append(sampled.squeeze(-1))
+        return torch.stack(next_codes, dim=1)
+
     logits = logits / max(args.temperature, 1e-5)
     filtered = filter_logits(logits, args.top_k, args.top_p)
     next_codes = []
@@ -285,35 +350,25 @@ def generate_rank_relaxed_window(args, prior_model, text_tokens, text_mask, num_
     text_mask = text_mask.to(device)
     hidden = None
     text_cond = prior_model.encode_text(text_tokens, text_mask)
-    current = torch.full(
-        (text_tokens.shape[0], 1),
-        fill_value=latent_bos_token(prior_model.config),
-        dtype=torch.long,
-        device=device,
-    )
+    current = prior_model.bos_codes(text_tokens.shape[0], device)
     outputs: List[torch.Tensor] = []
     history: List[torch.Tensor] = []
 
     if prefix_codes is not None and prefix_codes.numel() > 0:
         prefix_codes = prefix_codes.to(device=device, dtype=torch.long)
-        for step_idx in range(prefix_codes.shape[1]):
-            code_emb = prior_model.code_embedding(current)
-            cond = text_cond.unsqueeze(1)
-            x = torch.cat([code_emb, cond], dim=-1)
-            _, hidden = prior_model.rnn(x, hidden)
-            current = prefix_codes[:, step_idx:step_idx + 1]
+        if prefix_codes.dim() == 2 and getattr(prior_model, "num_quantizers", 1) == 1:
+            prefix_codes = prefix_codes.unsqueeze(1)
+        for step_idx in range(prefix_codes.shape[-1]):
+            _, hidden = prior_model.forward_step(current, text_cond, hidden)
+            current = prefix_codes[..., step_idx]
             history.append(current)
 
     for _ in range(num_steps):
-        code_emb = prior_model.code_embedding(current)
-        cond = text_cond.unsqueeze(1)
-        x = torch.cat([code_emb, cond], dim=-1)
-        out, hidden = prior_model.rnn(x, hidden)
-        logits = prior_model.output_head(out[:, -1, :])
+        logits, hidden = prior_model.forward_step(current, text_cond, hidden)
         logits = apply_repetition_penalty(logits, history, args.repetition_penalty, args.repetition_window)
 
         if args.temperature <= 0:
-            next_code = torch.argmax(logits, dim=-1, keepdim=True)
+            next_code = torch.argmax(logits, dim=-1)
         else:
             next_code = sample_rank_relaxed_next_code(logits, args, rng)
 
@@ -321,12 +376,15 @@ def generate_rank_relaxed_window(args, prior_model, text_tokens, text_mask, num_
         history.append(next_code)
         current = next_code
 
-    return torch.cat(outputs, dim=1)
+    generated = torch.stack(outputs, dim=-1)
+    if getattr(prior_model, "num_quantizers", 1) == 1:
+        return generated[:, 0, :]
+    return generated
 
 
 def inject_creative_spans(mixed_new: torch.Tensor, proposal_new: torch.Tensor, args, rng: random.Random) -> torch.Tensor:
     result = mixed_new.clone()
-    total = result.shape[0]
+    total = code_step_count(result)
     if total <= 0:
         return result
 
@@ -338,12 +396,12 @@ def inject_creative_spans(mixed_new: torch.Tensor, proposal_new: torch.Tensor, a
         max_start = max(0, total - span_len)
         start = rng.randint(0, max_start)
         end = start + span_len
-        result[start:end] = proposal_new[start:end]
+        result[..., start:end] = proposal_new[..., start:end]
 
     token_mix = max(0.0, min(1.0, args.creative_token_mix))
     if token_mix > 0:
         mask = torch.rand(total) < token_mix
-        result[mask] = proposal_new[mask]
+        result[..., mask] = proposal_new[..., mask]
     return result
 
 
@@ -360,9 +418,9 @@ def fuse_source_and_proposal_window(
         anchored = source_new.clone()
     else:
         anchored = source_window.clone()
-        anchored[:prefix_len] = source_window[:prefix_len]
-        source_new = source_window[prefix_len:].clone()
-        proposal_new = proposal_full[prefix_len:].clone()
+        anchored[..., :prefix_len] = source_window[..., :prefix_len]
+        source_new = source_window[..., prefix_len:].clone()
+        proposal_new = proposal_full[..., prefix_len:].clone()
 
     creative = inject_creative_spans(source_new, proposal_new, args, rng)
     source_strength = max(0.0, min(1.0, args.source_strength))
@@ -373,11 +431,11 @@ def fuse_source_and_proposal_window(
         fused_new = creative
     else:
         fused_new = source_new.clone()
-        keep_source_mask = torch.rand(source_new.shape[0]) < source_strength
-        fused_new[~keep_source_mask] = creative[~keep_source_mask]
+        keep_source_mask = torch.rand(code_step_count(source_new)) < source_strength
+        fused_new[..., ~keep_source_mask] = creative[..., ~keep_source_mask]
 
     if prefix_len > 0:
-        anchored[prefix_len:] = fused_new
+        anchored[..., prefix_len:] = fused_new
         return anchored
     return fused_new
 
@@ -387,29 +445,29 @@ def generate_source_creative_ranked_codes(args, prior_model, text_tokens, text_m
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
-    generated = torch.empty(0, dtype=torch.long)
+    generated = empty_code_sequence(getattr(prior_model, "num_quantizers", 1))
     rng = random.Random(args.seed)
 
-    while generated.shape[0] < total_steps:
+    while code_step_count(generated) < total_steps:
         prefix_codes = None
         prefix_len = 0
-        if overlap_size > 0 and generated.shape[0] > 0:
-            prefix_codes = generated[-overlap_size:]
-            prefix_len = prefix_codes.shape[0]
+        if overlap_size > 0 and code_step_count(generated) > 0:
+            prefix_codes = extract_code_tail(generated, overlap_size)
+            prefix_len = code_step_count(prefix_codes)
 
-        new_steps = min(window_size if prefix_len == 0 else (window_size - prefix_len), total_steps - generated.shape[0])
+        new_steps = min(window_size if prefix_len == 0 else (window_size - prefix_len), total_steps - code_step_count(generated))
         generated_new = generate_rank_relaxed_window(
             args,
             prior_model,
             text_tokens,
             text_mask,
             new_steps,
-            prefix_codes=(None if prefix_codes is None else prefix_codes.unsqueeze(0)),
+            prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
             device=device,
             rng=rng,
         ).squeeze(0).cpu()
 
-        proposal_full = generated_new if prefix_codes is None else torch.cat([prefix_codes.cpu(), generated_new], dim=0)
+        proposal_full = generated_new if prefix_codes is None else concat_code_sequences(prefix_codes.cpu(), generated_new)
         candidates = find_source_window_candidates(
             proposal_full,
             prefix_codes,
@@ -435,11 +493,11 @@ def generate_source_creative_ranked_codes(args, prior_model, text_tokens, text_m
                 args,
                 rng,
             )
-            chosen_new = fused_window[prefix_len:prefix_len + new_steps]
+            chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
         else:
             chosen_new = generated_new
 
-        generated = torch.cat([generated, chosen_new], dim=0)
+        generated = concat_code_sequences(generated, chosen_new)
 
     return generated.unsqueeze(0).to(device)
 
@@ -475,6 +533,7 @@ def main():
         device,
         args.source_candidates,
         args.max_source_seconds,
+        target_num_quantizers=getattr(prior_model, "num_quantizers", 1),
     )
     if not candidate_entries:
         raise RuntimeError("No source candidates found for source-creative generation.")

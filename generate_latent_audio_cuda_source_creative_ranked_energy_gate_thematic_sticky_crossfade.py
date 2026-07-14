@@ -78,6 +78,12 @@ fuse_source_and_proposal_window = base.fuse_source_and_proposal_window
 measure_window_energy = energy_gate.measure_window_energy
 measure_audio_chunk_energies = energy_gate.measure_audio_chunk_energies
 clip_has_sufficient_energy = energy_gate.clip_has_sufficient_energy
+code_step_count = base.code_step_count
+empty_code_sequence = base.empty_code_sequence
+extract_code_tail = base.extract_code_tail
+ensure_batched_codes = base.ensure_batched_codes
+concat_code_sequences = base.concat_code_sequences
+slice_code_steps = base.slice_code_steps
 
 
 def summarize_clip_loudness(chunk_energies: List[Dict[str, float]]) -> Dict[str, float]:
@@ -120,7 +126,7 @@ def choose_theme_entry(
         return None
 
     pool = candidate_entries[:max(1, min(top_n, len(candidate_entries)))]
-    viable = [entry for entry in pool if entry["codes"].shape[0] >= window_size]
+    viable = [entry for entry in pool if code_step_count(entry["codes"]) >= window_size]
     working = viable or pool
     if not working:
         return None
@@ -220,9 +226,9 @@ def blend_theme_windows(
         take_new_probability = max(0.0, min(1.0, absolute_progress))
         source_idx = prefix_len + idx
         if rng.random() > take_new_probability:
-            blended[source_idx] = old_window[source_idx]
+            blended[..., source_idx] = old_window[..., source_idx]
         else:
-            blended[source_idx] = new_window[source_idx]
+            blended[..., source_idx] = new_window[..., source_idx]
     return blended
 
 
@@ -241,7 +247,7 @@ def generate_source_creative_ranked_codes(
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
-    generated = torch.empty(0, dtype=torch.long)
+    generated = empty_code_sequence(getattr(prior_model, "num_quantizers", 1))
     rng = random.Random(args.seed)
     steps_per_second = total_steps / max(config.clip_seconds, 1e-6)
     theme_steps = max(1, int(round(max(0.1, args.theme_seconds) * steps_per_second)))
@@ -254,11 +260,11 @@ def generate_source_creative_ranked_codes(
     transition_steps_total = max(0, int(round((max(0, args.theme_crossfade_ms) / 1000.0) * steps_per_second)))
     transition_steps_done = transition_steps_total
 
-    while generated.shape[0] < total_steps:
+    while code_step_count(generated) < total_steps:
         if current_theme_entry is None or remaining_theme_steps <= 0:
-            if generated.shape[0] > segment_start:
-                segment_ranges.append((segment_start, generated.shape[0]))
-                segment_start = generated.shape[0]
+            if code_step_count(generated) > segment_start:
+                segment_ranges.append((segment_start, code_step_count(generated)))
+                segment_start = code_step_count(generated)
 
             previous_theme_entry = current_theme_entry
             current_theme_entry = choose_theme_entry(
@@ -287,12 +293,12 @@ def generate_source_creative_ranked_codes(
 
         prefix_codes = None
         prefix_len = 0
-        if overlap_size > 0 and generated.shape[0] > 0:
-            prefix_codes = generated[-overlap_size:]
-            prefix_len = prefix_codes.shape[0]
+        if overlap_size > 0 and code_step_count(generated) > 0:
+            prefix_codes = extract_code_tail(generated, overlap_size)
+            prefix_len = code_step_count(prefix_codes)
 
         max_new_steps = window_size if prefix_len == 0 else (window_size - prefix_len)
-        new_steps = min(max_new_steps, total_steps - generated.shape[0], remaining_theme_steps)
+        new_steps = min(max_new_steps, total_steps - code_step_count(generated), remaining_theme_steps)
         if new_steps <= 0:
             current_theme_entry = None
             remaining_theme_steps = 0
@@ -304,12 +310,12 @@ def generate_source_creative_ranked_codes(
             text_tokens,
             text_mask,
             new_steps,
-            prefix_codes=(None if prefix_codes is None else prefix_codes.unsqueeze(0)),
+            prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
             device=device,
             rng=rng,
         ).squeeze(0).cpu()
 
-        proposal_full = generated_new if prefix_codes is None else torch.cat([prefix_codes.cpu(), generated_new], dim=0)
+        proposal_full = generated_new if prefix_codes is None else concat_code_sequences(prefix_codes.cpu(), generated_new)
         chosen = choose_theme_window(
             proposal_full,
             prefix_codes,
@@ -360,7 +366,7 @@ def generate_source_creative_ranked_codes(
                     transition_steps_done,
                     rng,
                 )
-                chosen_new = blended_window[prefix_len:prefix_len + new_steps]
+                chosen_new = slice_code_steps(blended_window, prefix_len, prefix_len + new_steps)
             else:
                 fused_window = fuse_source_and_proposal_window(
                     proposal_full,
@@ -369,7 +375,7 @@ def generate_source_creative_ranked_codes(
                     args,
                     rng,
                 )
-                chosen_new = fused_window[prefix_len:prefix_len + new_steps]
+                chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
         elif chosen is not None:
             fused_window = fuse_source_and_proposal_window(
                 proposal_full,
@@ -378,16 +384,16 @@ def generate_source_creative_ranked_codes(
                 args,
                 rng,
             )
-            chosen_new = fused_window[prefix_len:prefix_len + new_steps]
+            chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
         else:
             chosen_new = generated_new
 
-        generated = torch.cat([generated, chosen_new], dim=0)
+        generated = concat_code_sequences(generated, chosen_new)
         remaining_theme_steps -= new_steps
         transition_steps_done = min(transition_steps_total, transition_steps_done + new_steps)
 
-    if generated.shape[0] > segment_start:
-        segment_ranges.append((segment_start, generated.shape[0]))
+    if code_step_count(generated) > segment_start:
+        segment_ranges.append((segment_start, code_step_count(generated)))
 
     return generated.unsqueeze(0).to(device), segment_ranges
 
@@ -401,7 +407,7 @@ def decode_and_stitch_segments(
     theme_crossfade_ms: int,
 ) -> torch.Tensor:
     waveforms: List[torch.Tensor] = []
-    total_steps = max(1, int(codes.shape[1]))
+    total_steps = max(1, int(codes.shape[-1]))
     segment_count = len(segment_ranges)
     samples_per_step = tokenizer_config.clip_samples / float(total_steps)
     fade_samples = int(tokenizer_config.sample_rate * max(0, theme_crossfade_ms) / 1000)
@@ -416,8 +422,8 @@ def decode_and_stitch_segments(
     for segment_idx, (start, end) in enumerate(segment_ranges):
         left_context = min(start, context_steps) if segment_idx > 0 else 0
         right_context = min(total_steps - end, context_steps) if segment_idx < (segment_count - 1) else 0
-        segment_codes = codes[:, start - left_context:end + right_context]
-        expanded_steps = max(1, segment_codes.shape[1])
+        segment_codes = codes[..., start - left_context:end + right_context]
+        expanded_steps = max(1, segment_codes.shape[-1])
         expanded_target_length = max(1, int(round(tokenizer_config.clip_samples * (expanded_steps / total_steps))))
         waveform = tokenizer_model.decode_codes(segment_codes, target_length=expanded_target_length).squeeze(0).cpu()
         waveforms.append(waveform)
@@ -492,6 +498,7 @@ def main():
         device,
         args.source_candidates,
         args.max_source_seconds,
+        target_num_quantizers=getattr(prior_model, "num_quantizers", 1),
     )
     if not candidate_entries:
         raise RuntimeError("No source candidates found for source-creative generation.")

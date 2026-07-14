@@ -13,6 +13,7 @@ from latent_audio_token_pipeline import (
     crop_or_pad,
     load_audio_mono,
     load_dataset_items,
+    load_tokenizer_state_dict,
     safe_torch_load,
 )
 
@@ -56,11 +57,12 @@ def get_device(allow_cpu: bool) -> torch.device:
     raise RuntimeError("CUDA is required for this script. Re-run with --allow-cpu to override.")
 
 
-def choose_input_audios(args) -> list[str]:
+def choose_input_audios(args, sample_rate: int) -> list[str]:
     sample_count = max(1, int(args.sample_count))
     if args.input_audio:
         if not os.path.isfile(args.input_audio):
             raise FileNotFoundError(f"Input audio not found: {args.input_audio}")
+        load_audio_mono(args.input_audio, sample_rate)
         if sample_count > 1:
             raise ValueError("--sample-count cannot exceed 1 when --input-audio is provided.")
         return [args.input_audio]
@@ -84,8 +86,27 @@ def choose_input_audios(args) -> list[str]:
         )
 
     if args.random_sample:
-        return random.sample(unique_paths, sample_count)
-    return unique_paths[:sample_count]
+        random.shuffle(unique_paths)
+
+    selected_paths: list[str] = []
+    invalid_count = 0
+    for path in unique_paths:
+        try:
+            load_audio_mono(path, sample_rate)
+            selected_paths.append(path)
+        except Exception as exc:
+            invalid_count += 1
+            print(f"Skipping invalid audio file: {path} ({exc})")
+        if len(selected_paths) >= sample_count:
+            break
+
+    if len(selected_paths) < sample_count:
+        raise RuntimeError(
+            f"Only found {len(selected_paths)} decodable audio files out of {len(unique_paths)} unique dataset items"
+            f" while requesting {sample_count}. Skipped {invalid_count} invalid files."
+        )
+
+    return selected_paths
 
 
 def load_audio_tokenizer_from_checkpoint(tokenizer_dir: str, checkpoint_path: str, config_path: str, device: torch.device):
@@ -102,9 +123,32 @@ def load_audio_tokenizer_from_checkpoint(tokenizer_dir: str, checkpoint_path: st
 
     model = VQAudioAutoencoder(config)
     state = safe_torch_load(checkpoint, device)
-    model.load_state_dict(state)
+    load_tokenizer_state_dict(model, state)
     model.to(device).eval()
     return model, config, checkpoint
+
+
+def print_error_bucket_stats(metric_name: str, values: list[float]):
+    if not values:
+        return
+
+    bucket_definitions = [
+        ("<= 0.00001", lambda value: value <= 0.00001),
+        ("0.00001 to 0.0001", lambda value: 0.00001 < value <= 0.0001),
+        ("0.0001 to 0.001", lambda value: 0.0001 < value <= 0.001),
+        ("0.001 to 0.005", lambda value: 0.001 < value <= 0.005),
+        ("0.005 to 0.01", lambda value: 0.005 < value <= 0.01),
+        ("0.01 to 0.02", lambda value: 0.01 < value <= 0.02),
+        ("0.02 to 0.05", lambda value: 0.02 < value < 0.05),
+        (">= 0.05", lambda value: value >= 0.05),
+    ]
+
+    total = len(values)
+    print(f"{metric_name} bucket stats:")
+    for label, predicate in bucket_definitions:
+        count = sum(1 for value in values if predicate(value))
+        pct = (count / total) * 100.0
+        print(f"  {label}: {count}/{total} ({pct:.2f}%)")
 
 
 def main():
@@ -121,9 +165,11 @@ def main():
         device,
     )
     os.makedirs(args.output_dir, exist_ok=True)
-    input_audios = choose_input_audios(args)
+    input_audios = choose_input_audios(args, config.sample_rate)
     total_mae = 0.0
     total_mse = 0.0
+    mae_values: list[float] = []
+    mse_values: list[float] = []
 
     print(f"Checkpoint: {checkpoint_used}")
     print(f"Sample rate: {config.sample_rate}")
@@ -150,6 +196,8 @@ def main():
         mse = torch.mean((reconstructed - waveform.cpu()) ** 2).item()
         total_mae += mae
         total_mse += mse
+        mae_values.append(mae)
+        mse_values.append(mse)
 
         print(f"Sample {sample_idx}: {input_audio}")
         print(f"Latent steps: {codes.shape[1]}")
@@ -161,6 +209,8 @@ def main():
     if len(input_audios) > 1:
         print(f"Average MAE: {total_mae / len(input_audios):.6f}")
         print(f"Average MSE: {total_mse / len(input_audios):.6f}")
+    print_error_bucket_stats("MAE", mae_values)
+    print_error_bucket_stats("MSE", mse_values)
     print("Listen to both files. If the reconstructed clip already sounds poor, the tokenizer is the main bottleneck.")
 
 

@@ -72,13 +72,19 @@ fuse_source_and_proposal_window = base.fuse_source_and_proposal_window
 measure_window_energy = energy_gate.measure_window_energy
 measure_audio_chunk_energies = energy_gate.measure_audio_chunk_energies
 clip_has_sufficient_energy = energy_gate.clip_has_sufficient_energy
+code_step_count = base.code_step_count
+empty_code_sequence = base.empty_code_sequence
+extract_code_tail = base.extract_code_tail
+ensure_batched_codes = base.ensure_batched_codes
+concat_code_sequences = base.concat_code_sequences
+slice_code_steps = base.slice_code_steps
 
 
 def choose_theme_entry(candidate_entries: List[Dict], top_n: int, window_size: int, rng: random.Random) -> Optional[Dict]:
     if not candidate_entries:
         return None
     pool = candidate_entries[:max(1, min(top_n, len(candidate_entries)))]
-    viable = [entry for entry in pool if entry["codes"].shape[0] >= window_size]
+    viable = [entry for entry in pool if code_step_count(entry["codes"]) >= window_size]
     working = viable or pool
     if not working:
         return None
@@ -126,14 +132,14 @@ def generate_source_creative_ranked_codes(
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
-    generated = torch.empty(0, dtype=torch.long)
+    generated = empty_code_sequence(getattr(prior_model, "num_quantizers", 1))
     rng = random.Random(args.seed)
     steps_per_second = total_steps / max(config.clip_seconds, 1e-6)
     theme_steps = max(1, int(round(max(0.1, args.theme_seconds) * steps_per_second)))
     current_theme_entry: Optional[Dict] = None
     remaining_theme_steps = 0
 
-    while generated.shape[0] < total_steps:
+    while code_step_count(generated) < total_steps:
         if current_theme_entry is None or remaining_theme_steps <= 0:
             current_theme_entry = choose_theme_entry(candidate_entries, args.theme_top_n, window_size, rng)
             remaining_theme_steps = theme_steps
@@ -145,12 +151,12 @@ def generate_source_creative_ranked_codes(
 
         prefix_codes = None
         prefix_len = 0
-        if overlap_size > 0 and generated.shape[0] > 0:
-            prefix_codes = generated[-overlap_size:]
-            prefix_len = prefix_codes.shape[0]
+        if overlap_size > 0 and code_step_count(generated) > 0:
+            prefix_codes = extract_code_tail(generated, overlap_size)
+            prefix_len = code_step_count(prefix_codes)
 
         max_new_steps = window_size if prefix_len == 0 else (window_size - prefix_len)
-        new_steps = min(max_new_steps, total_steps - generated.shape[0], remaining_theme_steps)
+        new_steps = min(max_new_steps, total_steps - code_step_count(generated), remaining_theme_steps)
         if new_steps <= 0:
             current_theme_entry = None
             remaining_theme_steps = 0
@@ -162,12 +168,12 @@ def generate_source_creative_ranked_codes(
             text_tokens,
             text_mask,
             new_steps,
-            prefix_codes=(None if prefix_codes is None else prefix_codes.unsqueeze(0)),
+            prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
             device=device,
             rng=rng,
         ).squeeze(0).cpu()
 
-        proposal_full = generated_new if prefix_codes is None else torch.cat([prefix_codes.cpu(), generated_new], dim=0)
+        proposal_full = generated_new if prefix_codes is None else concat_code_sequences(prefix_codes.cpu(), generated_new)
         themed_entries = [current_theme_entry] if current_theme_entry is not None else candidate_entries
         candidates = find_source_window_candidates(
             proposal_full,
@@ -194,11 +200,11 @@ def generate_source_creative_ranked_codes(
                 args,
                 rng,
             )
-            chosen_new = fused_window[prefix_len:prefix_len + new_steps]
+            chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
         else:
             chosen_new = generated_new
 
-        generated = torch.cat([generated, chosen_new], dim=0)
+        generated = concat_code_sequences(generated, chosen_new)
         remaining_theme_steps -= new_steps
 
     return generated.unsqueeze(0).to(device)
@@ -235,6 +241,7 @@ def main():
         device,
         args.source_candidates,
         args.max_source_seconds,
+        target_num_quantizers=getattr(prior_model, "num_quantizers", 1),
     )
     if not candidate_entries:
         raise RuntimeError("No source candidates found for source-creative generation.")

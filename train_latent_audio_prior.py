@@ -16,7 +16,9 @@ from latent_audio_token_pipeline import (
     latent_bos_token,
     load_audio_tokenizer_bundle,
     load_dataset_items,
+    load_latent_prior_state_dict,
     safe_audio_collate,
+    safe_torch_load,
     save_latent_prior_bundle,
 )
 
@@ -37,6 +39,7 @@ def parse_args():
     parser.add_argument("--max-vocab-size", type=int, default=20000)
     parser.add_argument("--val-ratio", type=float, default=0.02)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
+    parser.add_argument("--finetune-from", default="", help="Optional latent prior checkpoint file or directory to continue training from.")
     parser.add_argument("--random-crop", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -57,15 +60,37 @@ def get_device(allow_cpu: bool) -> torch.device:
 
 
 def build_code_inputs_targets(indices: torch.Tensor, config: LatentAudioConfig):
+    if indices.dim() == 2:
+        bos = torch.full(
+            (indices.shape[0], 1),
+            fill_value=latent_bos_token(config),
+            dtype=torch.long,
+            device=indices.device,
+        )
+        input_codes = torch.cat([bos, indices[:, :-1]], dim=1)
+        target_codes = indices.long()
+        return input_codes, target_codes
+
     bos = torch.full(
-        (indices.shape[0], 1),
+        (indices.shape[0], indices.shape[1], 1),
         fill_value=latent_bos_token(config),
         dtype=torch.long,
         device=indices.device,
     )
-    input_codes = torch.cat([bos, indices[:, :-1]], dim=1)
+    input_codes = torch.cat([bos, indices[..., :-1]], dim=-1)
     target_codes = indices.long()
     return input_codes, target_codes
+
+
+def compute_prior_loss(logits: torch.Tensor, target_codes: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_codes.reshape(-1))
+
+
+def encode_training_codes(audio_tokenizer, waveform: torch.Tensor) -> torch.Tensor:
+    return audio_tokenizer.encode_codes(
+        waveform,
+        return_all_codes=(getattr(audio_tokenizer.config, "num_quantizers", 1) > 1),
+    )
 
 
 @torch.no_grad()
@@ -78,10 +103,10 @@ def evaluate(audio_tokenizer, prior, loader, device, config):
         waveform = batch["waveform"].to(device, non_blocking=True)
         text_tokens = batch["text_tokens"].to(device, non_blocking=True)
         text_mask = batch["text_mask"].to(device, non_blocking=True)
-        codes = audio_tokenizer.encode_codes(waveform)
+        codes = encode_training_codes(audio_tokenizer, waveform)
         input_codes, target_codes = build_code_inputs_targets(codes, config)
         logits, _ = prior(input_codes, text_tokens, text_mask)
-        loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_codes.reshape(-1))
+        loss = compute_prior_loss(logits, target_codes)
         losses.append(float(loss.item()))
     prior.train()
     return sum(losses) / max(1, len(losses))
@@ -142,6 +167,14 @@ def main():
     )
 
     prior = TextConditionedLatentPrior(text_tokenizer.vocab_size, config).to(device)
+    if args.finetune_from:
+        prior_checkpoint = args.finetune_from
+        if os.path.isdir(prior_checkpoint):
+            best_path = os.path.join(prior_checkpoint, "best_latent_prior.pt")
+            prior_checkpoint = best_path if os.path.isfile(best_path) else os.path.join(prior_checkpoint, "latent_prior.pt")
+        state = safe_torch_load(prior_checkpoint, device)
+        load_latent_prior_state_dict(prior, state)
+        print(f"Fine-tuning latent prior from {prior_checkpoint}")
     optimizer = torch.optim.AdamW(prior.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
@@ -162,12 +195,12 @@ def main():
             text_mask = batch["text_mask"].to(device, non_blocking=True)
 
             with torch.no_grad():
-                codes = audio_tokenizer.encode_codes(waveform)
+                codes = encode_training_codes(audio_tokenizer, waveform)
             input_codes, target_codes = build_code_inputs_targets(codes, config)
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits, _ = prior(input_codes, text_tokens, text_mask)
-                loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_codes.reshape(-1))
+                loss = compute_prior_loss(logits, target_codes)
                 loss = loss / max(1, args.grad_accum_steps)
 
             scaler.scale(loss).backward()
