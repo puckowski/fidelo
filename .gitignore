@@ -64,7 +64,7 @@ best_*.pt
 !latent_blend_20260502_064314_5bed7855.wav
 !latent_blend_diverse_20260506_163925_0956c05f.wav
 !latent_blend_less_repeat_20260514_172655_5a708d92.wav
-!latent_blend_diverse_20260506_163925_0956c05f.wav
+!samples/*
 *.tmp
 *.bak
 
