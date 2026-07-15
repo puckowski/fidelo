@@ -70,7 +70,7 @@ def parse_args():
         "--residual-finetune-warmup-epochs",
         type=int,
         default=2,
-        help="Epochs to freeze the encoder and existing quantizers while training new residual quantizers and the decoder.",
+        help="Epochs to freeze the encoder and existing quantizers during fine-tuning while training new residual quantizers and the decoder.",
     )
     parser.add_argument("--random-crop", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
@@ -290,7 +290,7 @@ def main():
 
     learning_rate = args.lr
     if learning_rate is None:
-        learning_rate = 5e-5 if args.finetune_from != "" else 2e-4
+        learning_rate = 5e-5 if args.finetune_from.strip() else 2e-4
     print(f"Tokenizer learning rate: {learning_rate:g}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))

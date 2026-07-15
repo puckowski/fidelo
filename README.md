@@ -9,7 +9,7 @@ python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out 
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
 python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
 
-For a five-epoch tokenizer fine-tune:
+### Five-epoch tokenizer fine-tuning
 - A single-stream tokenizer automatically gains a second residual quantizer. This upgrade intentionally applies only to single-stream tokenizers; choose higher stream counts explicitly with `--num-quantizers`.
 - The first two epochs freeze the encoder and existing quantizer while training the new stream and decoder.
 - The default learning rate is `5e-5`; override it with `--lr`.
