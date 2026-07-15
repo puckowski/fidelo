@@ -209,6 +209,8 @@ def load_audio_mono(path: str, sample_rate: int) -> torch.Tensor:
         waveform = waveform.mean(dim=0, keepdim=True)
     if sr != sample_rate:
         waveform = _resample_waveform(waveform, sr, sample_rate)
+    if waveform.numel() == 0 or not torch.isfinite(waveform).all():
+        raise ValueError(f"Audio is empty or contains non-finite samples: {path}")
     return waveform.clamp(-1.0, 1.0)
 
 
@@ -360,19 +362,25 @@ class VectorQuantizer(nn.Module):
 
     def quantize(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # latents: [B, C, T]
-        flat = latents.permute(0, 2, 1).reshape(-1, self.code_dim)
-        distances = (
-            flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * flat @ self.codebook.weight.t()
-            + self.codebook.weight.pow(2).sum(dim=1)
-        )
-        indices = torch.argmin(distances, dim=1)
-        quantized = self.codebook(indices).view(latents.shape[0], latents.shape[2], self.code_dim).permute(0, 2, 1)
+        with torch.amp.autocast(latents.device.type, enabled=False):
+            latents_float = latents.float()
+            flat = latents_float.permute(0, 2, 1).reshape(-1, self.code_dim)
+            codebook = self.codebook.weight.float()
+            distances = (
+                flat.pow(2).sum(dim=1, keepdim=True)
+                - 2 * flat @ codebook.t()
+                + codebook.pow(2).sum(dim=1)
+            )
+            indices = torch.argmin(distances, dim=1)
+            quantized_float = codebook[indices].view(
+                latents.shape[0], latents.shape[2], self.code_dim
+            ).permute(0, 2, 1)
 
-        codebook_loss = F.mse_loss(quantized, latents.detach())
-        commitment_loss = F.mse_loss(quantized.detach(), latents)
+            codebook_loss = F.mse_loss(quantized_float, latents_float.detach())
+            commitment_loss = F.mse_loss(quantized_float.detach(), latents_float)
         loss = codebook_loss + self.commitment_cost * commitment_loss
         indices = indices.view(latents.shape[0], latents.shape[2])
+        quantized = quantized_float.to(latents.dtype)
         return quantized, loss, indices
 
     def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -83,34 +83,35 @@ def multi_resolution_stft_loss(reconstructed: torch.Tensor, target: torch.Tensor
         (512, 128, 512),
         (1024, 256, 1024),
     ]
-    total = reconstructed.new_tensor(0.0)
-    rec = reconstructed.squeeze(1)
-    tgt = target.squeeze(1)
+    with torch.amp.autocast(reconstructed.device.type, enabled=False):
+        total = reconstructed.new_tensor(0.0, dtype=torch.float32)
+        rec = reconstructed.squeeze(1).float()
+        tgt = target.squeeze(1).float()
 
-    for n_fft, hop_length, win_length in resolutions:
-        window = torch.hann_window(win_length, device=reconstructed.device)
-        rec_spec = torch.stft(
-            rec,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            return_complex=True,
-        )
-        tgt_spec = torch.stft(
-            tgt,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            return_complex=True,
-        )
+        for n_fft, hop_length, win_length in resolutions:
+            window = torch.hann_window(win_length, device=reconstructed.device)
+            rec_spec = torch.stft(
+                rec,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                return_complex=True,
+            )
+            tgt_spec = torch.stft(
+                tgt,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                return_complex=True,
+            )
 
-        rec_mag = rec_spec.abs().clamp_min(1e-5)
-        tgt_mag = tgt_spec.abs().clamp_min(1e-5)
-        mag_loss = torch.mean(torch.abs(rec_mag - tgt_mag))
-        log_mag_loss = torch.mean(torch.abs(torch.log(rec_mag) - torch.log(tgt_mag)))
-        total = total + mag_loss + log_mag_loss
+            rec_mag = rec_spec.abs().clamp_min(1e-5)
+            tgt_mag = tgt_spec.abs().clamp_min(1e-5)
+            mag_loss = torch.mean(torch.abs(rec_mag - tgt_mag))
+            log_mag_loss = torch.mean(torch.abs(torch.log(rec_mag) - torch.log(tgt_mag)))
+            total = total + mag_loss + log_mag_loss
 
     return total / len(resolutions)
 
@@ -329,6 +330,11 @@ def main():
                 )
                 loss = loss / max(1, args.grad_accum_steps)
 
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Non-finite tokenizer loss before backward: "
+                    f"recon={recon_loss.item():.6g}, stft={stft_loss.item():.6g}, vq={vq_loss.item():.6g}"
+                )
             scaler.scale(loss).backward()
             should_step = ((steps + 1) % max(1, args.grad_accum_steps) == 0)
             if should_step:
