@@ -203,6 +203,7 @@ def choose_theme_window(
         args.continuity_weight,
         args.match_weight,
         args.scan_step_divisor,
+        max_candidates=args.window_energy_check_top,
     )
     return select_top_window_with_energy_gate(candidates, args, tokenizer_model, device)
 
@@ -543,7 +544,13 @@ def main():
                 args.clip_energy_check_seconds,
             )
             loudness_summary = summarize_clip_loudness(chunk_energies)
-            if clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args) and clip_has_sufficient_loudness(chunk_energies, args):
+            has_sufficient_energy = clip_has_sufficient_energy(
+                candidate_waveform,
+                tokenizer_config.sample_rate,
+                args,
+                chunk_energies=chunk_energies,
+            )
+            if has_sufficient_energy and clip_has_sufficient_loudness(chunk_energies, args):
                 accepted_waveform = candidate_waveform
                 quietest_accepted_chunk = min(
                     chunk_energies,
@@ -560,7 +567,7 @@ def main():
                 break
 
             worst_chunk = min(chunk_energies, key=lambda item: (item["rms"], item["peak"]))
-            if not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args):
+            if not has_sufficient_energy:
                 print(
                     "Rejected low-energy clip "
                     f"{clip_idx + 1} attempt {retry_idx + 1}/{retry_count} "

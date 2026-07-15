@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import heapq
 import math
 import random
 import re
@@ -197,40 +198,64 @@ def find_source_window_candidates(
     continuity_weight: float,
     match_weight: float,
     scan_step_divisor: int,
+    max_candidates: Optional[int] = None,
 ) -> List[Dict]:
     proposal_full = proposal_full.cpu()
     prefix_len = 0 if prefix_codes is None else min(overlap_size, code_step_count(prefix_codes))
     prefix_tail = None if prefix_codes is None else extract_code_tail(prefix_codes, prefix_len).cpu()
     window_size = code_step_count(proposal_full)
     step = max(1, window_size // max(1, scan_step_divisor))
-    candidates: List[Dict] = []
+    candidate_limit = None if max_candidates is None else max(1, int(max_candidates))
+    candidates = []
+    candidate_index = 0
 
     for entry in candidate_entries:
         seq = entry["codes"]
         if code_step_count(seq) < window_size:
             continue
-        for start in range(0, code_step_count(seq) - window_size + 1, step):
-            window = slice_code_steps(seq, start, start + window_size)
-            proposal_match = (window == slice_code_steps(proposal_full, 0, window_size)).float().mean().item()
-            continuity = 0.0
-            if prefix_tail is not None and prefix_len > 0:
-                continuity = (slice_code_steps(window, 0, prefix_len) == prefix_tail).float().mean().item()
+        windows = seq.unfold(-1, window_size, step).movedim(-2, 0)
+        proposal_matches = (
+            (windows == slice_code_steps(proposal_full, 0, window_size))
+            .float()
+            .mean(dim=tuple(range(1, windows.dim())))
+            .tolist()
+        )
+        if prefix_tail is not None and prefix_len > 0:
+            continuities = (
+                (windows[..., :prefix_len] == prefix_tail)
+                .float()
+                .mean(dim=tuple(range(1, windows.dim())))
+                .tolist()
+            )
+        else:
+            continuities = [0.0] * len(proposal_matches)
+
+        for window_idx, (proposal_match, continuity) in enumerate(zip(proposal_matches, continuities)):
+            start = window_idx * step
             score = (
                 (continuity_weight * continuity)
                 + (proposal_weight * proposal_match)
                 + (match_weight * entry["match_score"])
             )
-            candidates.append(
-                {
-                    "score": score,
-                    "window": window.clone(),
-                    "entry": entry,
-                    "start": start,
-                }
-            )
+            candidate = (score, -candidate_index, candidate_index, entry, start)
+            if candidate_limit is None:
+                candidates.append(candidate)
+            elif len(candidates) < candidate_limit:
+                heapq.heappush(candidates, candidate)
+            elif candidate[:2] > candidates[0][:2]:
+                heapq.heapreplace(candidates, candidate)
+            candidate_index += 1
 
-    candidates.sort(key=lambda item: item["score"], reverse=True)
-    return candidates
+    candidates.sort(key=lambda item: (-item[0], item[2]))
+    return [
+        {
+            "score": score,
+            "window": slice_code_steps(entry["codes"], start, start + window_size).clone(),
+            "entry": entry,
+            "start": start,
+        }
+        for score, _, _, entry, start in candidates
+    ]
 
 
 def choose_source_window_creatively(candidates: List[Dict], top_n: int, temperature: float, rng: random.Random) -> Optional[Dict]:
@@ -309,20 +334,29 @@ def sample_rank_relaxed_next_code(logits: torch.Tensor, args, rng: random.Random
         return torch.stack(next_codes, dim=1)
 
     logits = logits / max(args.temperature, 1e-5)
-    filtered = filter_logits(logits, args.top_k, args.top_p)
     next_codes = []
 
-    for batch_idx in range(filtered.shape[0]):
-        row = filtered[batch_idx]
-        finite_mask = torch.isfinite(row)
-        valid_indices = torch.nonzero(finite_mask, as_tuple=False).squeeze(-1)
+    for batch_idx in range(logits.shape[0]):
+        row = logits[batch_idx]
+        if args.top_k is not None and 0 < args.top_k < row.shape[-1]:
+            top_values = torch.topk(row, k=args.top_k, dim=-1).values
+            valid_indices = torch.nonzero(row >= top_values[-1], as_tuple=False).squeeze(-1)
+        else:
+            valid_indices = torch.arange(row.shape[-1], device=row.device)
         if valid_indices.numel() == 0:
             next_codes.append(torch.argmax(logits[batch_idx]).view(1))
             continue
 
         valid_logits = row[valid_indices]
-        sorted_logits, order = torch.sort(valid_logits, descending=True)
+        order = torch.argsort(valid_logits, descending=True, stable=True)
+        sorted_logits = valid_logits[order]
         sorted_indices = valid_indices[order]
+        if args.top_p is not None and 0.0 < args.top_p < 1.0:
+            cumulative = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            keep_mask = cumulative <= args.top_p
+            keep_mask[0] = True
+            sorted_logits = sorted_logits[keep_mask]
+            sorted_indices = sorted_indices[keep_mask]
         probs = torch.softmax(sorted_logits, dim=-1)
 
         alt_cap = min(max(1, args.rank_choice_top), sorted_indices.numel())
@@ -477,6 +511,7 @@ def generate_source_creative_ranked_codes(args, prior_model, text_tokens, text_m
             args.continuity_weight,
             args.match_weight,
             args.scan_step_divisor,
+            max_candidates=args.window_choice_top,
         )
         chosen = choose_source_window_creatively(
             candidates,
