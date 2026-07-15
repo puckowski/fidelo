@@ -9,6 +9,8 @@ python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out 
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
 python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
 
+Fine-tuning a single-stream tokenizer automatically adds a second residual quantizer, warms up only the new stream and decoder for two epochs, and uses a `5e-5` learning rate unless overridden. To retain the prior no-warmup behavior, pass `--residual-finetune-warmup-epochs 0`.
+
 ## Inference
 
 python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade.py --prompt "instrumental pop" --seed 88 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 12 --min-window-rms 0.012 --min-window-peak 0.04 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024  --theme-repeat-bonus 3.5
