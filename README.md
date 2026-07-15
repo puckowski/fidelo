@@ -9,7 +9,7 @@ python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out 
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
 python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
 
-Fine-tuning a single-stream tokenizer automatically adds a second residual quantizer, warms up only the new stream and decoder for two epochs, and uses a `5e-5` learning rate unless overridden. To retain the prior no-warmup behavior, pass `--residual-finetune-warmup-epochs 0`.
+Fine-tuning a single-stream tokenizer automatically adds a second residual quantizer, warms up only the new stream and decoder for two epochs, and uses a `5e-5` learning rate unless overridden. This upgrade intentionally applies only to single-stream tokenizers; choose higher stream counts explicitly with `--num-quantizers`. To retain the prior no-warmup behavior, pass `--residual-finetune-warmup-epochs 0`.
 
 ## Inference
 
