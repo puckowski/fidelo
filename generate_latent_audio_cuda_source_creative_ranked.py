@@ -340,9 +340,12 @@ def sample_rank_relaxed_next_code(logits: torch.Tensor, args, rng: random.Random
         row = logits[batch_idx]
         if args.top_k is not None and 0 < args.top_k < row.shape[-1]:
             top_values = torch.topk(row, k=args.top_k, dim=-1).values
-            valid_indices = torch.nonzero(row >= top_values[-1], as_tuple=False).squeeze(-1)
+            valid_indices = torch.nonzero(
+                torch.isfinite(row) & (row >= top_values[-1]),
+                as_tuple=False,
+            ).squeeze(-1)
         else:
-            valid_indices = torch.arange(row.shape[-1], device=row.device)
+            valid_indices = torch.nonzero(torch.isfinite(row), as_tuple=False).squeeze(-1)
         if valid_indices.numel() == 0:
             next_codes.append(torch.argmax(logits[batch_idx]).view(1))
             continue
