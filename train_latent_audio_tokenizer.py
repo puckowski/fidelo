@@ -209,6 +209,7 @@ def evaluate(model, loader, device):
 
 def main():
     args = parse_args()
+    args.finetune_from = args.finetune_from.strip()
     set_seed(args.seed)
     device = get_device(args.allow_cpu)
     print(f"Tokenizer training device: {device}")
@@ -290,7 +291,7 @@ def main():
 
     learning_rate = args.lr
     if learning_rate is None:
-        learning_rate = 5e-5 if args.finetune_from.strip() else 2e-4
+        learning_rate = 5e-5 if args.finetune_from else 2e-4
     print(f"Tokenizer learning rate: {learning_rate:g}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
