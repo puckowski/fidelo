@@ -25,6 +25,8 @@ WORD_RE = re.compile(r"[a-z0-9']+")
 
 
 class WindowCandidate(NamedTuple):
+    """Scored source window with insertion-order fields for deterministic heap ranking."""
+
     score: float
     tie_breaker: int
     index: int
@@ -246,6 +248,7 @@ def find_source_window_candidates(
                 + (proposal_weight * proposal_match)
                 + (match_weight * entry["match_score"])
             )
+            # Negation makes later equal-score candidates the first evicted from the min-heap.
             candidate = WindowCandidate(score, -candidate_index, candidate_index, entry, start)
             if candidate_limit is None:
                 candidates.append(candidate)
@@ -258,6 +261,7 @@ def find_source_window_candidates(
                 heapq.heapreplace(candidates, candidate)
             candidate_index += 1
 
+    # Match the original stable ordering: descending score, then ascending insertion index.
     candidates.sort(key=lambda item: (-item.score, item.index))
     return [
         {
