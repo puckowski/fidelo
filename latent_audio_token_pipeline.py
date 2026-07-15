@@ -210,7 +210,7 @@ def load_audio_mono(path: str, sample_rate: int) -> torch.Tensor:
     if sr != sample_rate:
         waveform = _resample_waveform(waveform, sr, sample_rate)
     if waveform.numel() == 0 or not torch.isfinite(waveform).all():
-        raise ValueError(f"Audio contains no finite samples: {path}")
+        raise ValueError(f"Audio is empty or contains non-finite samples: {path}")
     return waveform.clamp(-1.0, 1.0)
 
 
