@@ -77,6 +77,14 @@ Fine tune with lower weight decay, higher commitment cost, 4 gradient accumulati
 
 Model V4 reconstructs audio 1.69% more faithfully than Model V3.
 
+## Model V5
+
+Model V5 reconstructs audio 0.52% more faithfully than Model V4.
+
+## Model V6
+
+Model V6 reconstructs audio 12.07% more faithfully than Model V1.
+
 ## Dataset Preparation
 
 Started with a 10,000 sample subset from a larger Free Music Archive audio clip and description dataset.
