@@ -6,7 +6,7 @@ import random
 import re
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -22,6 +22,14 @@ from latent_audio_token_pipeline import (
 
 
 WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+class WindowCandidate(NamedTuple):
+    score: float
+    tie_breaker: int
+    index: int
+    entry: Dict
+    start: int
 
 
 def parse_args():
@@ -200,6 +208,7 @@ def find_source_window_candidates(
     scan_step_divisor: int,
     max_candidates: Optional[int] = None,
 ) -> List[Dict]:
+    """Rank source windows, optionally retaining only the best max_candidates entries."""
     proposal_full = proposal_full.cpu()
     prefix_len = 0 if prefix_codes is None else min(overlap_size, code_step_count(prefix_codes))
     prefix_tail = None if prefix_codes is None else extract_code_tail(prefix_codes, prefix_len).cpu()
@@ -237,16 +246,19 @@ def find_source_window_candidates(
                 + (proposal_weight * proposal_match)
                 + (match_weight * entry["match_score"])
             )
-            candidate = (score, -candidate_index, candidate_index, entry, start)
+            candidate = WindowCandidate(score, -candidate_index, candidate_index, entry, start)
             if candidate_limit is None:
                 candidates.append(candidate)
             elif len(candidates) < candidate_limit:
                 heapq.heappush(candidates, candidate)
-            elif candidate[:2] > candidates[0][:2]:
+            elif (candidate.score, candidate.tie_breaker) > (
+                candidates[0].score,
+                candidates[0].tie_breaker,
+            ):
                 heapq.heapreplace(candidates, candidate)
             candidate_index += 1
 
-    candidates.sort(key=lambda item: (-item[0], item[2]))
+    candidates.sort(key=lambda item: (-item.score, item.index))
     return [
         {
             "score": score,
@@ -351,6 +363,7 @@ def sample_rank_relaxed_next_code(logits: torch.Tensor, args, rng: random.Random
             continue
 
         valid_logits = row[valid_indices]
+        # Stable ordering keeps equal-logit token IDs deterministic for seeded sampling.
         order = torch.argsort(valid_logits, descending=True, stable=True)
         sorted_logits = valid_logits[order]
         sorted_indices = valid_indices[order]
