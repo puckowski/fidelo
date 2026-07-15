@@ -1,0 +1,737 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Fidelo latent music generation training and inference architecture.">
+  <title>Fidelo — Architecture</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f4f7ff;
+      --muted: #a9b4cc;
+      --panel: rgba(16, 22, 42, 0.82);
+      --line: rgba(150, 169, 215, 0.2);
+      --cyan: #5ee8ff;
+      --violet: #9b87ff;
+      --pink: #ff7ac8;
+      --green: #73e6ae;
+      --amber: #ffc96b;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 5%, rgba(94, 232, 255, 0.14), transparent 28rem),
+        radial-gradient(circle at 88% 18%, rgba(155, 135, 255, 0.15), transparent 30rem),
+        #070a13;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    body::before {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      content: "";
+      opacity: 0.22;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(to bottom, black, transparent 80%);
+    }
+
+    a { color: inherit; }
+
+    .shell {
+      width: min(1480px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 72px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      border: 1px solid rgba(94, 232, 255, 0.5);
+      border-radius: 9px;
+      background: linear-gradient(135deg, rgba(94, 232, 255, 0.25), rgba(155, 135, 255, 0.25));
+      box-shadow: 0 0 24px rgba(94, 232, 255, 0.18);
+      display: grid;
+      place-items: center;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 24px;
+      color: var(--muted);
+      font-size: 0.84rem;
+      font-weight: 650;
+    }
+
+    .nav-links a { text-decoration: none; }
+    .nav-links a:hover { color: var(--ink); }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.7fr);
+      gap: 64px;
+      align-items: end;
+      padding: 92px 0 74px;
+    }
+
+    .eyebrow {
+      margin: 0 0 18px;
+      color: var(--cyan);
+      font: 700 0.75rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 920px;
+      margin: 0;
+      font-size: clamp(3.4rem, 8.2vw, 8.2rem);
+      font-weight: 790;
+      letter-spacing: -0.072em;
+      line-height: 0.88;
+    }
+
+    h1 span {
+      color: transparent;
+      background: linear-gradient(95deg, var(--cyan), #b2a6ff 52%, var(--pink));
+      background-clip: text;
+      -webkit-background-clip: text;
+    }
+
+    .intro {
+      max-width: 440px;
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 1.5vw, 1.15rem);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      margin-bottom: 94px;
+      border-block: 1px solid var(--line);
+    }
+
+    .stat {
+      min-height: 108px;
+      padding: 24px 28px;
+      border-right: 1px solid var(--line);
+    }
+
+    .stat:last-child { border-right: 0; }
+
+    .stat strong {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 1.55rem;
+      letter-spacing: -0.04em;
+    }
+
+    .stat span {
+      color: var(--muted);
+      font: 650 0.72rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    section { margin: 0 0 110px; }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(250px, 0.45fr) minmax(300px, 0.55fr);
+      gap: 48px;
+      align-items: end;
+      margin-bottom: 28px;
+    }
+
+    .section-number {
+      display: block;
+      margin-bottom: 12px;
+      color: var(--cyan);
+      font: 700 0.72rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.16em;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(2rem, 4.2vw, 4.25rem);
+      letter-spacing: -0.055em;
+      line-height: 0.98;
+    }
+
+    .section-copy {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.98rem;
+    }
+
+    .diagram-card {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background:
+        linear-gradient(145deg, rgba(255, 255, 255, 0.035), transparent 32%),
+        var(--panel);
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(18px);
+    }
+
+    .diagram-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font: 650 0.69rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    .lights { display: flex; gap: 7px; }
+    .lights i { width: 7px; height: 7px; border-radius: 50%; background: #34405b; }
+    .lights i:first-child { background: var(--cyan); box-shadow: 0 0 12px var(--cyan); }
+
+    .diagram-wrap {
+      overflow-x: auto;
+      padding: 16px;
+    }
+
+    svg {
+      display: block;
+      min-width: 1120px;
+      width: 100%;
+      height: auto;
+    }
+
+    svg text { font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .lane { fill: rgba(7, 10, 19, 0.42); stroke: rgba(150, 169, 215, 0.13); }
+    .lane-label { fill: #71809e; font-size: 11px; font-weight: 750; letter-spacing: 1.6px; }
+    .node { fill: #121a30; stroke: #344262; stroke-width: 1.2; }
+    .node-cyan { fill: #102534; stroke: #3da6ba; }
+    .node-violet { fill: #201d3b; stroke: #6f63c8; }
+    .node-pink { fill: #301a32; stroke: #ad5289; }
+    .node-green { fill: #122c28; stroke: #3c9e7a; }
+    .node-amber { fill: #302718; stroke: #ad8540; }
+    .node-title { fill: #f4f7ff; font-size: 15px; font-weight: 750; }
+    .node-copy { fill: #a9b4cc; font-size: 11.5px; }
+    .node-code { fill: #7889aa; font: 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .tag { fill: rgba(94, 232, 255, 0.1); stroke: rgba(94, 232, 255, 0.25); }
+    .tag-text { fill: #8ceeff; font: 700 9px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.6px; }
+    .flow {
+      fill: none;
+      stroke: #63779d;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      marker-end: url(#arrow);
+    }
+    .flow-cyan { stroke: #58cfe6; }
+    .flow-violet { stroke: #8d7dec; }
+    .flow-pink { stroke: #df6dac; }
+    .flow-dashed { stroke-dasharray: 6 7; }
+    .flow-label { fill: #7787a7; font: 9.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .detail {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(13, 18, 34, 0.68);
+    }
+
+    .detail-kicker {
+      display: inline-flex;
+      padding: 5px 8px;
+      border: 1px solid rgba(94, 232, 255, 0.2);
+      border-radius: 999px;
+      color: var(--cyan);
+      font: 700 0.62rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .detail h3 {
+      margin: 16px 0 8px;
+      font-size: 1.12rem;
+      letter-spacing: -0.025em;
+    }
+
+    .detail p, .detail li {
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .detail p { margin: 0; }
+    .detail ul { padding-left: 18px; margin: 8px 0 0; }
+    code { color: #d9d3ff; font: 0.91em ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .precision {
+      display: grid;
+      grid-template-columns: 0.8fr 1.2fr;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--panel);
+    }
+
+    .precision-intro {
+      padding: 46px;
+      background:
+        radial-gradient(circle at 0 0, rgba(94, 232, 255, 0.17), transparent 65%),
+        rgba(12, 18, 33, 0.7);
+    }
+
+    .precision-intro h2 { font-size: clamp(2.2rem, 4vw, 4rem); }
+    .precision-intro p { color: var(--muted); }
+
+    .precision-list { display: grid; }
+
+    .precision-row {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 24px;
+      padding: 26px 32px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .precision-row:last-child { border-bottom: 0; }
+    .precision-row strong { color: var(--cyan); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .precision-row p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 34px 0 48px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    @media (max-width: 900px) {
+      header, .section-head, .precision { grid-template-columns: 1fr; }
+      header { gap: 28px; padding-top: 64px; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .stat:nth-child(2) { border-right: 0; }
+      .stat:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
+      .detail-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 620px) {
+      .shell { width: min(100% - 24px, 1480px); }
+      .nav-links { display: none; }
+      h1 { font-size: clamp(3.2rem, 19vw, 5rem); }
+      .stats, .detail-grid { grid-template-columns: 1fr; }
+      .stat { border-right: 0; border-bottom: 1px solid var(--line); }
+      .stat:last-child { border-bottom: 0; }
+      .precision-intro { padding: 30px; }
+      .precision-row { grid-template-columns: 1fr; gap: 8px; padding: 24px; }
+      footer { flex-direction: column; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav aria-label="Primary navigation">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">ƒ</span>
+        FIDELO
+      </a>
+      <div class="nav-links">
+        <a href="#training">Training</a>
+        <a href="#inference">Inference</a>
+        <a href="#precision">Precision map</a>
+      </div>
+    </nav>
+
+    <main id="top">
+      <header>
+        <div>
+          <p class="eyebrow">Latent music generation · system map</p>
+          <h1>Sound, <span>compressed.</span><br>Structure, learned.</h1>
+        </div>
+        <p class="intro">
+          Fidelo is a two-stage PyTorch system: a residual vector-quantized audio
+          autoencoder learns discrete sound tokens, then a text-conditioned GRU
+          learns to arrange those tokens into music.
+        </p>
+      </header>
+
+      <div class="stats" aria-label="Default architecture settings">
+        <div class="stat"><strong>44.1 kHz</strong><span>Mono waveform input</span></div>
+        <div class="stat"><strong>4,096</strong><span>Codes per codebook</span></div>
+        <div class="stat"><strong>384d</strong><span>Latent embedding</span></div>
+        <div class="stat"><strong>3 × 768</strong><span>GRU layers × hidden</span></div>
+      </div>
+
+      <section id="training">
+        <div class="section-head">
+          <div>
+            <span class="section-number">01 / TRAINING</span>
+            <h2>Two stages.<br>One token language.</h2>
+          </div>
+          <p class="section-copy">
+            Stage A teaches the tokenizer to preserve waveform and spectral detail.
+            Stage B freezes that tokenizer, converts dataset audio into code IDs, and
+            trains the prior with teacher forcing to predict the next code.
+          </p>
+        </div>
+
+        <div class="diagram-card">
+          <div class="diagram-toolbar">
+            <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
+            <span>train_latent_audio_tokenizer.py → train_latent_audio_prior.py</span>
+          </div>
+          <div class="diagram-wrap">
+            <svg viewBox="0 0 1400 800" role="img" aria-labelledby="training-title training-desc">
+              <title id="training-title">Fidelo training architecture</title>
+              <desc id="training-desc">Two horizontal lanes show tokenizer reconstruction training and text-conditioned latent prior training.</desc>
+              <defs>
+                <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"></path>
+                </marker>
+                <linearGradient id="train-glow" x1="0" x2="1">
+                  <stop offset="0" stop-color="#5ee8ff" stop-opacity=".16"></stop>
+                  <stop offset="1" stop-color="#9b87ff" stop-opacity=".06"></stop>
+                </linearGradient>
+              </defs>
+
+              <rect class="lane" x="22" y="44" width="1356" height="336" rx="18"></rect>
+              <rect class="lane" x="22" y="420" width="1356" height="336" rx="18"></rect>
+              <text class="lane-label" x="46" y="75">STAGE A · TOKENIZER / RECONSTRUCTION</text>
+              <text class="lane-label" x="46" y="451">STAGE B · PRIOR / AUTOREGRESSIVE CODE MODELING</text>
+
+              <rect class="node node-cyan" x="50" y="128" width="178" height="146" rx="15"></rect>
+              <text class="node-title" x="70" y="158">Dataset waveform</text>
+              <text class="node-copy" x="70" y="183">mono · 44,100 Hz</text>
+              <text class="node-copy" x="70" y="202">crop / zero-pad</text>
+              <text class="node-code" x="70" y="225">[B, 1, samples]</text>
+              <rect class="tag" x="70" y="240" width="49" height="18" rx="9"></rect>
+              <text class="tag-text" x="82" y="252">FP32</text>
+
+              <rect class="node" x="278" y="104" width="200" height="194" rx="15"></rect>
+              <text class="node-title" x="298" y="135">Conv encoder</text>
+              <text class="node-copy" x="298" y="160">1 → 128 → 256 → 512</text>
+              <text class="node-copy" x="298" y="179">strides 4 · 4 · 2</text>
+              <text class="node-copy" x="298" y="198">GroupNorm + GELU</text>
+              <text class="node-copy" x="298" y="217">residual dilations 1, 2…</text>
+              <text class="node-copy" x="298" y="236">4 bottleneck blocks</text>
+              <text class="node-code" x="298" y="261">total stride = 32</text>
+              <text class="node-code" x="298" y="278">latent channels = 384</text>
+
+              <rect class="node node-violet" x="528" y="92" width="238" height="218" rx="15"></rect>
+              <text class="node-title" x="548" y="124">Residual VQ</text>
+              <text class="node-copy" x="548" y="149">2 pre-quant residual blocks</text>
+              <text class="node-copy" x="548" y="168">nearest code by L2 distance</text>
+              <text class="node-copy" x="548" y="187">4,096 × 384 codebook</text>
+              <text class="node-copy" x="548" y="206">Q streams configured ≥ 1</text>
+              <text class="node-copy" x="548" y="225">residual passed to next Q</text>
+              <text class="node-copy" x="548" y="244">straight-through gradient</text>
+              <text class="node-code" x="548" y="268">Lᵥq = codebook + β·commit</text>
+              <text class="node-code" x="548" y="287">β = 0.10 default</text>
+
+              <rect class="node" x="816" y="104" width="204" height="194" rx="15"></rect>
+              <text class="node-title" x="836" y="135">Conv decoder</text>
+              <text class="node-copy" x="836" y="160">3 post-quant residual blocks</text>
+              <text class="node-copy" x="836" y="179">transposed Conv1d upsample</text>
+              <text class="node-copy" x="836" y="198">512 → 256 → 128 → 1</text>
+              <text class="node-copy" x="836" y="217">GroupNorm + GELU</text>
+              <text class="node-copy" x="836" y="236">tanh waveform output</text>
+              <text class="node-code" x="836" y="261">match original length</text>
+
+              <rect class="node node-pink" x="1070" y="92" width="280" height="218" rx="15"></rect>
+              <text class="node-title" x="1090" y="124">Composite objective</text>
+              <text class="node-copy" x="1090" y="149">waveform L1 reconstruction</text>
+              <text class="node-copy" x="1090" y="168">+ vector-quantizer loss</text>
+              <text class="node-copy" x="1090" y="187">+ 0.35 × multi-res STFT</text>
+              <text class="node-code" x="1090" y="213">FFT 256 / 512 / 1024</text>
+              <text class="node-code" x="1090" y="232">magnitude + log magnitude</text>
+              <text class="node-copy" x="1090" y="258">AdamW · grad clip 1.0</text>
+              <text class="node-copy" x="1090" y="277">GradScaler · accumulation ×2</text>
+              <rect class="tag" x="1278" y="260" width="52" height="18" rx="9"></rect>
+              <text class="tag-text" x="1288" y="272">AMP</text>
+
+              <path class="flow flow-cyan" d="M228 201 C246 201 260 201 278 201"></path>
+              <path class="flow" d="M478 201 C496 201 510 201 528 201"></path>
+              <path class="flow flow-violet" d="M766 201 C784 201 798 201 816 201"></path>
+              <path class="flow flow-pink" d="M1020 201 C1038 201 1052 201 1070 201"></path>
+              <path class="flow flow-dashed flow-pink" d="M1070 288 C1034 350 266 350 228 255"></path>
+              <text class="flow-label" x="594" y="346">BACKPROPAGATION THROUGH RECONSTRUCTION + STRAIGHT-THROUGH VQ</text>
+
+              <rect class="node node-cyan" x="50" y="508" width="178" height="146" rx="15"></rect>
+              <text class="node-title" x="70" y="538">Prompt + audio</text>
+              <text class="node-copy" x="70" y="563">metadata.csv pair</text>
+              <text class="node-copy" x="70" y="582">simple word tokens</text>
+              <text class="node-code" x="70" y="605">text ≤ 40 tokens</text>
+              <text class="node-code" x="70" y="624">audio [B, 1, N]</text>
+
+              <rect class="node node-violet" x="278" y="496" width="200" height="170" rx="15"></rect>
+              <text class="node-title" x="298" y="527">Frozen tokenizer</text>
+              <text class="node-copy" x="298" y="552">encoder → residual VQ</text>
+              <text class="node-copy" x="298" y="571">emit Q streams of IDs</text>
+              <text class="node-code" x="298" y="596">[B, T] or [B, Q, T]</text>
+              <text class="node-copy" x="298" y="621">no gradients / eval mode</text>
+              <rect class="tag" x="298" y="635" width="49" height="18" rx="9"></rect>
+              <text class="tag-text" x="310" y="647">FP32</text>
+
+              <rect class="node" x="528" y="484" width="238" height="194" rx="15"></rect>
+              <text class="node-title" x="548" y="515">Conditioning + inputs</text>
+              <text class="node-copy" x="548" y="540">word embedding: 256d</text>
+              <text class="node-copy" x="548" y="559">mask → mean pool → tanh</text>
+              <text class="node-copy" x="548" y="578">code embeddings: 384d</text>
+              <text class="node-copy" x="548" y="597">Q streams summed / √Q</text>
+              <text class="node-copy" x="548" y="616">prepend BOS; shift right</text>
+              <text class="node-code" x="548" y="643">concat [384d + 256d]</text>
+
+              <rect class="node node-green" x="816" y="484" width="204" height="194" rx="15"></rect>
+              <text class="node-title" x="836" y="515">GRU prior</text>
+              <text class="node-copy" x="836" y="540">input size: 640</text>
+              <text class="node-copy" x="836" y="559">hidden size: 768</text>
+              <text class="node-copy" x="836" y="578">3 recurrent layers</text>
+              <text class="node-copy" x="836" y="597">dropout: 0.15</text>
+              <text class="node-copy" x="836" y="616">batch-first sequence</text>
+              <text class="node-code" x="836" y="643">hidden [3, B, 768]</text>
+
+              <rect class="node node-amber" x="1070" y="484" width="280" height="194" rx="15"></rect>
+              <text class="node-title" x="1090" y="515">Next-code objective</text>
+              <text class="node-copy" x="1090" y="540">one 4,096-way head per Q</text>
+              <text class="node-copy" x="1090" y="559">cross-entropy vs target IDs</text>
+              <text class="node-copy" x="1090" y="578">teacher-forced full sequence</text>
+              <text class="node-copy" x="1090" y="603">AdamW · grad clip 1.0</text>
+              <text class="node-copy" x="1090" y="622">GradScaler · accumulation ×4</text>
+              <text class="node-code" x="1090" y="649">save best validation loss</text>
+
+              <path class="flow flow-cyan" d="M228 581 C246 581 260 581 278 581"></path>
+              <path class="flow flow-violet" d="M478 581 C496 581 510 581 528 581"></path>
+              <path class="flow flow-cyan" d="M766 581 C784 581 798 581 816 581"></path>
+              <path class="flow" d="M1020 581 C1038 581 1052 581 1070 581"></path>
+              <path class="flow flow-dashed flow-pink" d="M1070 660 C1038 718 852 718 816 660"></path>
+              <text class="flow-label" x="879" y="711">CROSS-ENTROPY BACKPROP; TOKENIZER REMAINS FROZEN</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="detail-grid">
+          <article class="detail">
+            <span class="detail-kicker">Encoder</span>
+            <h3>32× temporal compression</h3>
+            <p>Three strided convolution stages reduce the waveform timeline while channels grow to 512, followed by a 384-channel latent bottleneck.</p>
+          </article>
+          <article class="detail">
+            <span class="detail-kicker">Quantizer</span>
+            <h3>Residual code streams</h3>
+            <p>Each quantizer selects its nearest learned 384d vector. With multiple quantizers, each stage encodes the previous stage’s remaining residual.</p>
+          </article>
+          <article class="detail">
+            <span class="detail-kicker">Optimizer</span>
+            <h3>Stable mixed precision</h3>
+            <p>CUDA autocast reduces eligible operation precision; gradient scaling, unscale-before-clipping, and AdamW keep updates stable.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="inference">
+        <div class="section-head">
+          <div>
+            <span class="section-number">02 / INFERENCE</span>
+            <h2>Prompt to waveform.</h2>
+          </div>
+          <p class="section-copy">
+            Inference is autoregressive and runs in evaluation mode without gradients.
+            Optional retrieval guidance compares model proposals with prompt-matched
+            dataset code windows before the frozen decoder reconstructs audio.
+          </p>
+        </div>
+
+        <div class="diagram-card">
+          <div class="diagram-toolbar">
+            <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
+            <span>generate_latent_audio_cuda.py · no_grad · CUDA by default</span>
+          </div>
+          <div class="diagram-wrap">
+            <svg viewBox="0 0 1400 650" role="img" aria-labelledby="inference-title inference-desc">
+              <title id="inference-title">Fidelo inference architecture</title>
+              <desc id="inference-desc">A smooth left-to-right flow shows prompt conditioning, GRU token generation, retrieval guidance, decoding, stitching, and WAV output.</desc>
+              <defs>
+                <marker id="arrow-infer" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"></path>
+                </marker>
+              </defs>
+              <style>
+                #inference-diagram-flow path { marker-end: url(#arrow-infer); }
+              </style>
+
+              <rect class="lane" x="22" y="50" width="1356" height="330" rx="18"></rect>
+              <rect class="lane" x="270" y="424" width="552" height="174" rx="18"></rect>
+              <text class="lane-label" x="46" y="81">PRIMARY GENERATION PATH · REPEATED PER CLIP</text>
+              <text class="lane-label" x="294" y="455">OPTIONAL RETRIEVAL GUIDANCE</text>
+
+              <rect class="node node-cyan" x="48" y="135" width="174" height="160" rx="15"></rect>
+              <text class="node-title" x="68" y="166">Text prompt</text>
+              <text class="node-copy" x="68" y="191">regex word tokenizer</text>
+              <text class="node-copy" x="68" y="210">pad / truncate to 40</text>
+              <text class="node-code" x="68" y="235">embedding: 256d</text>
+              <text class="node-code" x="68" y="254">masked mean + tanh</text>
+              <rect class="tag" x="68" y="268" width="49" height="18" rx="9"></rect>
+              <text class="tag-text" x="80" y="280">FP32</text>
+
+              <rect class="node node-green" x="270" y="117" width="226" height="196" rx="15"></rect>
+              <text class="node-title" x="290" y="148">Autoregressive GRU</text>
+              <text class="node-copy" x="290" y="173">start from BOS code</text>
+              <text class="node-copy" x="290" y="192">code emb + text condition</text>
+              <text class="node-copy" x="290" y="211">3 layers · hidden 768</text>
+              <text class="node-copy" x="290" y="230">one hidden-state step / token</text>
+              <text class="node-copy" x="290" y="249">one output head per Q stream</text>
+              <text class="node-code" x="290" y="275">logits [B, Q, 4096]</text>
+              <text class="node-code" x="290" y="292">no gradients · eval()</text>
+
+              <rect class="node node-violet" x="544" y="117" width="222" height="196" rx="15"></rect>
+              <text class="node-title" x="564" y="148">Sampling policy</text>
+              <text class="node-copy" x="564" y="173">temperature: 0.9</text>
+              <text class="node-copy" x="564" y="192">top-k: 32 · top-p: 0.92</text>
+              <text class="node-copy" x="564" y="211">repetition penalty: 1.1</text>
+              <text class="node-copy" x="564" y="230">history window: 128</text>
+              <text class="node-copy" x="564" y="249">multinomial per Q stream</text>
+              <text class="node-code" x="564" y="275">latent steps = ceil(N / 32)</text>
+              <text class="node-code" x="564" y="292">IDs [B, Q, T]</text>
+
+              <rect class="node node-pink" x="814" y="117" width="214" height="196" rx="15"></rect>
+              <text class="node-title" x="834" y="148">VQ lookup + decode</text>
+              <text class="node-copy" x="834" y="173">lookup each codebook</text>
+              <text class="node-copy" x="834" y="192">sum residual Q vectors</text>
+              <text class="node-copy" x="834" y="211">3 residual post blocks</text>
+              <text class="node-copy" x="834" y="230">ConvTranspose1d ×3</text>
+              <text class="node-copy" x="834" y="249">tanh → clamp [−1, 1]</text>
+              <text class="node-code" x="834" y="275">target clip length</text>
+              <rect class="tag" x="959" y="268" width="49" height="18" rx="9"></rect>
+              <text class="tag-text" x="971" y="280">FP32</text>
+
+              <rect class="node node-amber" x="1076" y="117" width="274" height="196" rx="15"></rect>
+              <text class="node-title" x="1096" y="148">Finish + write WAV</text>
+              <text class="node-copy" x="1096" y="173">40 ms clip crossfades</text>
+              <text class="node-copy" x="1096" y="192">trim requested duration</text>
+              <text class="node-copy" x="1096" y="211">remove DC mean</text>
+              <text class="node-copy" x="1096" y="230">peak ceiling: 0.98</text>
+              <text class="node-copy" x="1096" y="249">target RMS: 0.14; gain ≤ 1.5</text>
+              <text class="node-code" x="1096" y="275">soundfile → torchaudio fallback</text>
+              <text class="node-code" x="1096" y="292">mono · 44.1 kHz WAV</text>
+
+              <g id="inference-diagram-flow">
+                <path class="flow flow-cyan" d="M222 215 C238 215 254 215 270 215"></path>
+                <path class="flow" d="M496 215 C512 215 528 215 544 215"></path>
+                <path class="flow flow-violet" d="M766 215 C782 215 798 215 814 215"></path>
+                <path class="flow flow-pink" d="M1028 215 C1044 215 1060 215 1076 215"></path>
+              </g>
+
+              <rect class="node" x="294" y="476" width="210" height="92" rx="14"></rect>
+              <text class="node-title" x="314" y="506">Prompt-matched audio</text>
+              <text class="node-copy" x="314" y="530">rank metadata text overlap</text>
+              <text class="node-code" x="314" y="550">encode up to 8 candidates</text>
+
+              <rect class="node node-violet" x="574" y="476" width="224" height="92" rx="14"></rect>
+              <text class="node-title" x="594" y="506">Window reranking</text>
+              <text class="node-copy" x="594" y="530">continuity + proposal match</text>
+              <text class="node-code" x="594" y="550">diversity + prompt score</text>
+
+              <path class="flow flow-cyan" style="marker-end:url(#arrow-infer)" d="M504 522 C528 522 550 522 574 522"></path>
+              <path class="flow flow-violet flow-dashed" style="marker-end:url(#arrow-infer)" d="M686 476 C686 413 655 376 655 313"></path>
+              <text class="flow-label" x="700" y="405">CHOOSE GUIDED WINDOW</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="detail-grid">
+          <article class="detail">
+            <span class="detail-kicker">Context</span>
+            <h3>Text at every time step</h3>
+            <p>The same pooled 256d prompt vector is concatenated with each 384d code embedding, so the GRU remains conditioned throughout generation.</p>
+          </article>
+          <article class="detail">
+            <span class="detail-kicker">Sampling</span>
+            <h3>Controlled stochasticity</h3>
+            <p>Temperature, top-k, nucleus filtering, and recent-token penalties balance variation against coherence without changing model weights.</p>
+          </article>
+          <article class="detail">
+            <span class="detail-kicker">Guidance</span>
+            <h3>Retrieval, not attention</h3>
+            <p>Optional guidance substitutes high-scoring code windows from prompt-matched real clips; it is a generation-time reranker outside the GRU.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="precision">
+        <div class="precision">
+          <div class="precision-intro">
+            <span class="section-number">03 / NUMERICS</span>
+            <h2>Precision<br>with purpose.</h2>
+            <p>The code uses automatic mixed precision for both training scripts on CUDA, while ordinary inference does not enter an autocast region.</p>
+          </div>
+          <div class="precision-list">
+            <div class="precision-row">
+              <strong>FP32</strong>
+              <p>Input waveforms, stored parameters, optimizer state, validation, checkpoint serialization, and the default inference path use standard single precision.</p>
+            </div>
+            <div class="precision-row">
+              <strong>FP16 / AMP</strong>
+              <p>Inside CUDA training autocast, eligible convolution, matrix, GRU, and linear operations may execute in lower precision. PyTorch retains higher precision where required.</p>
+            </div>
+            <div class="precision-row">
+              <strong>GradScaler</strong>
+              <p>Scaled loss protects small FP16 gradients. Gradients are unscaled before the global norm is clipped to 1.0, then AdamW performs the update.</p>
+            </div>
+            <div class="precision-row">
+              <strong>INT64 IDs</strong>
+              <p>Text IDs, BOS, and latent code indices remain integer tensors. Quantization maps continuous 384d vectors to one of 4,096 discrete IDs per stream.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Fidelo · latent audio architecture reference</span>
+      <span>Source of truth: latent_audio_token_pipeline.py</span>
+    </footer>
+  </div>
+</body>
+</html>
