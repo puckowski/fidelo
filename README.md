@@ -7,6 +7,13 @@ Music generation project.
 python .\train_latent_audio_tokenizer.py --epochs 20  
 python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --epochs 20      
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
+python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
+
+### Single-stream tokenizer fine-tuning
+- A single-stream tokenizer automatically gains a second residual quantizer. This upgrade intentionally applies only to single-stream tokenizers; choose higher stream counts explicitly with `--num-quantizers`.
+- The first two epochs freeze the encoder and existing quantizer while training the new stream and decoder.
+- The default learning rate is `5e-5`; override it with `--lr`.
+- Pass `--num-quantizers 1` to retain a single stream, or `--residual-finetune-warmup-epochs 0` to retain the prior no-warmup behavior.
 
 ## Inference
 

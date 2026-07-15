@@ -107,7 +107,10 @@ def main():
     waveform_batch = waveform.unsqueeze(0).to(device)
 
     with torch.no_grad():
-        codes = tokenizer_model.encode_codes(waveform_batch)
+        codes = tokenizer_model.encode_codes(
+            waveform_batch,
+            return_all_codes=(getattr(tokenizer_model.config, "num_quantizers", 1) > 1),
+        )
         reconstructed = tokenizer_model.decode_codes(codes, target_length=target_samples).squeeze(0).cpu()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -123,7 +126,7 @@ def main():
 
     print(f"Input clip: {input_audio}")
     print(f"Sample rate: {config.sample_rate}")
-    print(f"Latent steps: {codes.shape[1]}")
+    print(f"Latent steps: {codes.shape[-1]}")
     print(f"Saved original clip to: {original_path}")
     print(f"Saved reconstructed clip to: {recon_path}")
     print(f"MAE: {mae:.6f}")
