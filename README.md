@@ -7,6 +7,7 @@ Music generation project.
 python .\train_latent_audio_tokenizer.py --epochs 20  
 python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --epochs 20      
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
+python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
 
 ## Inference
 

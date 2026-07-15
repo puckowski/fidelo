@@ -181,7 +181,10 @@ def main():
         waveform_batch = waveform.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            codes = tokenizer_model.encode_codes(waveform_batch)
+            codes = tokenizer_model.encode_codes(
+                waveform_batch,
+                return_all_codes=(getattr(tokenizer_model.config, "num_quantizers", 1) > 1),
+            )
             reconstructed = tokenizer_model.decode_codes(codes, target_length=config.clip_samples).squeeze(0).cpu()
 
         stem = Path(input_audio).stem
@@ -200,7 +203,7 @@ def main():
         mse_values.append(mse)
 
         print(f"Sample {sample_idx}: {input_audio}")
-        print(f"Latent steps: {codes.shape[1]}")
+        print(f"Latent steps: {codes.shape[-1]}")
         print(f"Saved original clip to: {original_path}")
         print(f"Saved reconstructed clip to: {recon_path}")
         print(f"MAE: {mae:.6f}")

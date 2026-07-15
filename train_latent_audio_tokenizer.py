@@ -30,14 +30,24 @@ def parse_args():
     parser.add_argument("--clip-seconds", type=float, default=3.33)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate. Defaults to 2e-4 for a new tokenizer and 5e-5 for fine-tuning.",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-ratio", type=float, default=0.02)
     parser.add_argument("--codebook-size", type=int, default=4096)
     parser.add_argument("--code-dim", type=int, default=384)
-    parser.add_argument("--num-quantizers", type=int, default=0)
+    parser.add_argument(
+        "--num-quantizers",
+        type=int,
+        default=0,
+        help="Override the number of residual quantizers. A single-stream tokenizer fine-tune defaults to two streams.",
+    )
     parser.add_argument("--commitment-cost", type=float, default=0.1)
     parser.add_argument("--encoder-channels", type=int, nargs="*", default=[128, 256, 512])
     parser.add_argument("--encoder-strides", type=int, nargs="*", default=[4, 4, 2])
@@ -55,7 +65,12 @@ def parse_args():
     parser.add_argument("--stft-weight", type=float, default=0.35)
     parser.add_argument("--grad-accum-steps", type=int, default=2)
     parser.add_argument("--finetune-from", default="", help="Directory containing a saved tokenizer bundle, or a specific tokenizer checkpoint file, to continue training from.")
-    parser.add_argument("--residual-finetune-warmup-epochs", type=int, default=0)
+    parser.add_argument(
+        "--residual-finetune-warmup-epochs",
+        type=int,
+        default=2,
+        help="Epochs to train only the new residual quantizer and decoder when adding a quantizer.",
+    )
     parser.add_argument("--random-crop", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -138,6 +153,8 @@ def load_tokenizer_for_finetuning(path: str, device: torch.device, num_quantizer
     source_num_quantizers = max(1, int(config.num_quantizers))
     if num_quantizers_override > 0:
         config.num_quantizers = max(1, int(num_quantizers_override))
+    elif source_num_quantizers == 1:
+        config.num_quantizers = 2
 
     model = VQAudioAutoencoder(config)
     state = safe_torch_load(checkpoint_path, device)
@@ -265,7 +282,11 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    learning_rate = args.lr
+    if learning_rate is None:
+        learning_rate = 5e-5 if args.finetune_from else 2e-4
+    print(f"Tokenizer learning rate: {learning_rate:g}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_score = math.inf
