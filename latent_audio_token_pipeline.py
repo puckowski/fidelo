@@ -372,7 +372,7 @@ class VectorQuantizer(nn.Module):
                 + codebook.pow(2).sum(dim=1)
             )
             indices = torch.argmin(distances, dim=1)
-            quantized_float = F.embedding(indices, codebook).view(
+            quantized_float = self.codebook(indices).float().view(
                 latents.shape[0], latents.shape[2], self.code_dim
             ).permute(0, 2, 1)
 
