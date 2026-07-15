@@ -254,6 +254,7 @@ def find_source_window_candidates(
                 candidates.append(candidate)
             elif len(candidates) < candidate_limit:
                 heapq.heappush(candidates, candidate)
+            # Lexicographic priority evicts lower scores first and later candidates on ties.
             elif (candidate.score, candidate.tie_breaker) > (
                 candidates[0].score,
                 candidates[0].tie_breaker,
