@@ -69,7 +69,7 @@ def parse_args():
         "--residual-finetune-warmup-epochs",
         type=int,
         default=2,
-        help="Epochs to train only the new residual quantizer and decoder when adding a quantizer.",
+        help="Epochs to train only new residual quantizers and the decoder when adding quantizers.",
     )
     parser.add_argument("--random-crop", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
@@ -155,6 +155,7 @@ def load_tokenizer_for_finetuning(path: str, device: torch.device, num_quantizer
         config.num_quantizers = max(1, int(num_quantizers_override))
     elif source_num_quantizers == 1:
         config.num_quantizers = 2
+        print("Expanding single-stream tokenizer fine-tune to two residual quantizers.")
 
     model = VQAudioAutoencoder(config)
     state = safe_torch_load(checkpoint_path, device)
