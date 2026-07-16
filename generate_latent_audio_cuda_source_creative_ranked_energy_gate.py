@@ -121,18 +121,10 @@ def measure_audio_chunk_energies(audio: torch.Tensor, sample_rate: int, chunk_se
     return results or [{"rms": 0.0, "peak": 0.0}]
 
 
-def clip_has_sufficient_energy(
-    audio: torch.Tensor,
-    sample_rate: int,
-    args,
-    chunk_energies: Optional[List[Dict[str, float]]] = None,
-) -> bool:
+def clip_has_sufficient_energy(audio: torch.Tensor, sample_rate: int, args) -> bool:
     min_rms = max(0.0, float(args.min_clip_rms))
     min_peak = max(0.0, float(args.min_clip_peak))
-    energies = chunk_energies
-    if energies is None:
-        energies = measure_audio_chunk_energies(audio, sample_rate, args.clip_energy_check_seconds)
-    for chunk_energy in energies:
+    for chunk_energy in measure_audio_chunk_energies(audio, sample_rate, args.clip_energy_check_seconds):
         if chunk_energy["rms"] < min_rms and chunk_energy["peak"] < min_peak:
             return False
     return True
@@ -222,7 +214,6 @@ def generate_source_creative_ranked_codes(
             args.continuity_weight,
             args.match_weight,
             args.scan_step_divisor,
-            max_candidates=args.window_energy_check_top,
         )
         chosen = select_source_window_with_energy_gate(
             candidates,

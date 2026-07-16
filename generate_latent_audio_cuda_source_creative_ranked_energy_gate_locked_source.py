@@ -93,7 +93,6 @@ def generate_source_creative_ranked_codes(
             args.continuity_weight,
             args.match_weight,
             args.scan_step_divisor,
-            max_candidates=args.window_energy_check_top,
         )
         chosen = select_source_window_with_energy_gate(
             candidates,

@@ -638,7 +638,7 @@ class TextConditionedLatentPrior(nn.Module):
             logits = logits[:, 0, :, :]
         return logits, hidden
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(
         self,
         text_tokens: torch.Tensor,

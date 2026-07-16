@@ -310,7 +310,6 @@ def choose_theme_window(
         args.continuity_weight,
         args.match_weight,
         args.scan_step_divisor,
-        max_candidates=args.window_energy_check_top,
     )
     return select_top_window_with_energy_gate(candidates, args, tokenizer_model, device)
 
@@ -340,7 +339,7 @@ def blend_theme_windows(
     return blended
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def generate_source_creative_ranked_codes(
     args,
     prior_model,
@@ -355,9 +354,7 @@ def generate_source_creative_ranked_codes(
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
-    generated_parts: List[torch.Tensor] = []
-    generated_tail = empty_code_sequence(getattr(prior_model, "num_quantizers", 1))
-    generated_steps = 0
+    generated = empty_code_sequence(getattr(prior_model, "num_quantizers", 1))
     rng = random.Random(args.seed)
     steps_per_second = total_steps / max(config.clip_seconds, 1e-6)
     theme_steps = max(1, int(round(max(0.1, args.theme_seconds) * steps_per_second)))
@@ -370,11 +367,11 @@ def generate_source_creative_ranked_codes(
     transition_steps_total = max(0, int(round((max(0, args.theme_crossfade_ms) / 1000.0) * steps_per_second)))
     transition_steps_done = transition_steps_total
 
-    while generated_steps < total_steps:
+    while code_step_count(generated) < total_steps:
         if current_theme_entry is None or remaining_theme_steps <= 0:
-            if generated_steps > segment_start:
-                segment_ranges.append((segment_start, generated_steps))
-                segment_start = generated_steps
+            if code_step_count(generated) > segment_start:
+                segment_ranges.append((segment_start, code_step_count(generated)))
+                segment_start = code_step_count(generated)
 
             previous_theme_entry = current_theme_entry
             current_theme_entry = choose_theme_entry(
@@ -403,12 +400,12 @@ def generate_source_creative_ranked_codes(
 
         prefix_codes = None
         prefix_len = 0
-        if overlap_size > 0 and generated_steps > 0:
-            prefix_codes = extract_code_tail(generated_tail, overlap_size)
+        if overlap_size > 0 and code_step_count(generated) > 0:
+            prefix_codes = extract_code_tail(generated, overlap_size)
             prefix_len = code_step_count(prefix_codes)
 
         max_new_steps = window_size if prefix_len == 0 else (window_size - prefix_len)
-        new_steps = min(max_new_steps, total_steps - generated_steps, remaining_theme_steps)
+        new_steps = min(max_new_steps, total_steps - code_step_count(generated), remaining_theme_steps)
         if new_steps <= 0:
             current_theme_entry = None
             remaining_theme_steps = 0
@@ -498,20 +495,13 @@ def generate_source_creative_ranked_codes(
         else:
             chosen_new = generated_new
 
-        generated_parts.append(chosen_new)
-        generated_steps += code_step_count(chosen_new)
-        if overlap_size > 0:
-            generated_tail = extract_code_tail(
-                concat_code_sequences(generated_tail, chosen_new),
-                overlap_size,
-            )
+        generated = concat_code_sequences(generated, chosen_new)
         remaining_theme_steps -= new_steps
         transition_steps_done = min(transition_steps_total, transition_steps_done + new_steps)
 
-    if generated_steps > segment_start:
-        segment_ranges.append((segment_start, generated_steps))
+    if code_step_count(generated) > segment_start:
+        segment_ranges.append((segment_start, code_step_count(generated)))
 
-    generated = concat_code_sequences(*generated_parts)
     return generated.unsqueeze(0).to(device), segment_ranges
 
 
@@ -670,13 +660,7 @@ def main():
                 args.clip_energy_check_seconds,
             )
             loudness_summary = summarize_clip_loudness(chunk_energies)
-            has_sufficient_energy = clip_has_sufficient_energy(
-                candidate_waveform,
-                tokenizer_config.sample_rate,
-                args,
-                chunk_energies=chunk_energies,
-            )
-            if has_sufficient_energy and clip_has_sufficient_loudness(chunk_energies, args):
+            if clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args) and clip_has_sufficient_loudness(chunk_energies, args):
                 accepted_waveform = candidate_waveform
                 quietest_accepted_chunk = min(
                     chunk_energies,
@@ -694,7 +678,7 @@ def main():
                 break
 
             worst_chunk = min(chunk_energies, key=lambda item: (item["rms"], item["peak"]))
-            if not has_sufficient_energy:
+            if not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args):
                 print(
                     "Rejected low-energy clip "
                     f"{clip_idx + 1} section={section_name} attempt {retry_idx + 1}/{retry_count} "
