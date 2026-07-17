@@ -8,6 +8,62 @@ python .\train_latent_audio_tokenizer.py --epochs 20
 python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --epochs 20      
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
 python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
+python .\train_latent_audio_tokenizer.py --finetune-from  latent_audio_tokenizer_out  --lr 5e-5 --weight-decay 5e-6 --grad-accum-steps 4 --commitment-cost 0.2 --clip-seconds 5 --num-quantizers 2 --epochs 5
+
+### Song-beginning conditioning
+
+The latent prior supports a dedicated input-only BOS token for clips taken from the actual start of a song. Add a `song_beginning` column to the prior-training metadata:
+
+```csv
+file,text,song_beginning
+intro_001.mp3,"genre rock; energetic guitars",1
+regular_001.mp3,"genre rock; energetic guitars",0
+```
+
+Accepted true values are `1`, `true`, `yes`, `y`, `beginning`, and `start`. Missing or empty values are treated as regular clips. Beginning-labelled files are always cropped from sample zero. The audio tokenizer does not need retraining; fine-tune only the latent prior and keep the saved text vocabulary beside the checkpoint:
+
+```powershell
+python .\train_latent_audio_prior.py `
+  --tokenizer-dir latent_audio_tokenizer_out `
+  --metadata-csv dataset/metadata_with_beginnings.csv `
+  --audio-dir dataset/audio `
+  --finetune-from latent_audio_prior_out `
+  --out-dir latent_audio_prior_beginning_out `
+  --lr 5e-5 `
+  --epochs 10
+```
+
+Generation scripts use beginning BOS for the first output clip by default. Use `--beginning-bos-clips N` to apply it to the first N clips, or `--beginning-bos-clips 0` to disable it:
+
+```powershell
+python .\generate_latent_audio_cuda.py `
+  --prompt "classic rock" `
+  --duration-seconds 30 `
+  --beginning-bos-clips 3
+```
+
+This changes how each selected clip starts. Later windows inside a clip continue to use their latent prefix rather than injecting beginning BOS again.
+
+In the structured generator, retrieval sources marked `song_beginning=1` are restricted to the intro section. Body and outro sections select only regular sources. `--beginning-bos-clips` controls the prior's BOS seed count; it does not allow beginning-labelled retrieval audio in later song sections.
+
+The structured generator can use quieter energy gates for clips that receive song-beginning BOS. Omitted beginning overrides inherit the regular value:
+
+```powershell
+--window-energy-check-top 12 `
+--min-window-rms 0.004 `
+--min-window-peak 0.018 `
+--clip-energy-check-seconds 2.0 `
+--min-clip-rms 0.006 `
+--min-clip-peak 0.028 `
+--beginning-window-energy-check-top 12 `
+--beginning-min-window-rms 0.001 `
+--beginning-min-window-peak 0.006 `
+--beginning-clip-energy-check-seconds 2.0 `
+--beginning-min-clip-rms 0.002 `
+--beginning-min-clip-peak 0.010
+```
+
+These overrides follow the actual BOS assignment, including a body clip covered by `--beginning-bos-clips N`. They affect both retrieved source-window checks and final generated-clip acceptance.
 
 ### Single-stream tokenizer fine-tuning
 - A single-stream tokenizer automatically gains a second residual quantizer. This upgrade intentionally applies only to single-stream tokenizers; choose higher stream counts explicitly with `--num-quantizers`.
@@ -24,8 +80,8 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
 python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured.py --prompt "classic rock" --seed 2 --duration-seconds 30 --source-strength 0.85 --top-k 4 --top-p 0.95 --rank-choice-top 2 --window-energy-check-top 12 --min-window-rms 0.012 --min-window-peak 0.04 --theme-repeat-window 6 --theme-crossfade-ms 1000 --source-overlap 1024 --theme-repeat-bonus 3.5 --intro-ratio 0.2 --outro-ratio 0.2 --intro-theme-top-n 1 --outro-theme-top-n 1 --intro-theme-seconds 2.8 --outro-theme-seconds 3.2 --intro-repeat-bonus 6.0 --outro-repeat-bonus 7.0 --song-intro-fade-ms 220 --song-outro-fade-ms 2200
 
 python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured.py `
-  --prompt "genre Classical; styles Classical" `
-  --seed 1001 `
+  --prompt "electropop" `
+  --seed 54367 `
   --duration-seconds 30 `
   --source-strength 0.85 `
   --top-k 4 `
@@ -53,6 +109,52 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
   --song-intro-fade-ms 220 `
   --song-outro-fade-ms 2200
 
+python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured.py `
+  --prompt "electropop" `
+  --seed 123 `
+  --duration-seconds 30 `
+  --source-strength 0.58 `
+  --temperature 1.0 `
+  --top-k 8 `
+  --top-p 0.92 `
+  --repetition-penalty 1.08 `
+  --rank-choice-prob 0.4 `
+  --rank-choice-top 4 `
+  --rank-choice-temperature 0.8 `
+  --creative-span-count 6 `
+  --creative-span-min 12 `
+  --creative-span-max 36 `
+  --creative-token-mix 0.24 `
+  --window-energy-check-top 12 `
+  --min-window-rms 0.004 `
+  --min-window-peak 0.018 `
+  --clip-energy-check-seconds 2.0 `
+  --min-clip-rms 0.006 `
+  --min-clip-peak 0.028 `
+  --clip-retry-count 8 `
+  --theme-top-n 8 `
+  --theme-temperature 1.0 `
+  --theme-repeat-window 4 `
+  --theme-crossfade-ms 1000 `
+  --source-overlap 128 `
+  --theme-repeat-bonus 1.5 `
+  --intro-ratio 0.2 `
+  --outro-ratio 0.2 `
+  --intro-theme-top-n 2 `
+  --outro-theme-top-n 2 `
+  --intro-theme-seconds 2.8 `
+  --outro-theme-seconds 3.2 `
+  --intro-repeat-bonus 3.0 `
+  --outro-repeat-bonus 4.0 `
+  --intro-source-strength 0.68 `
+  --outro-source-strength 0.72 `
+  --intro-creative-token-mix 0.18 `
+  --outro-creative-token-mix 0.14 `
+  --intro-rank-choice-prob 0.24 `
+  --outro-rank-choice-prob 0.18 `
+  --song-intro-fade-ms 220 `
+  --song-outro-fade-ms 2200
+  
 ## Model V2
 
 After right-sizing the context length, model V2 quality improved.

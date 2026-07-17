@@ -263,7 +263,7 @@
 
     .detail-grid {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       gap: 14px;
       margin-top: 14px;
     }
@@ -399,7 +399,7 @@
 
       <div class="stats" aria-label="Default architecture settings">
         <div class="stat"><strong>44.1 kHz</strong><span>Mono waveform input</span></div>
-        <div class="stat"><strong>4,096</strong><span>Codes per codebook</span></div>
+        <div class="stat"><strong>2,048</strong><span>Audio IDs per codebook</span></div>
         <div class="stat"><strong>384d</strong><span>Latent embedding</span></div>
         <div class="stat"><strong>3 × 768</strong><span>GRU layers × hidden</span></div>
       </div>
@@ -463,7 +463,7 @@
               <text class="node-title" x="548" y="124">Residual VQ</text>
               <text class="node-copy" x="548" y="149">2 pre-quant residual blocks</text>
               <text class="node-copy" x="548" y="168">nearest code by L2 distance</text>
-              <text class="node-copy" x="548" y="187">4,096 × 384 codebook</text>
+              <text class="node-copy" x="548" y="187">2,048 × 384 codebook</text>
               <text class="node-copy" x="548" y="206">Q streams configured ≥ 1</text>
               <text class="node-copy" x="548" y="225">residual passed to next Q</text>
               <text class="node-copy" x="548" y="244">straight-through gradient</text>
@@ -500,8 +500,8 @@
 
               <rect class="node node-cyan" x="50" y="508" width="178" height="146" rx="15"></rect>
               <text class="node-title" x="70" y="538">Prompt + audio</text>
-              <text class="node-copy" x="70" y="563">metadata.csv pair</text>
-              <text class="node-copy" x="70" y="582">simple word tokens</text>
+              <text class="node-copy" x="70" y="563">metadata.csv pair + flag</text>
+              <text class="node-copy" x="70" y="582">song_beginning: 0 or 1</text>
               <text class="node-code" x="70" y="605">text ≤ 40 tokens</text>
               <text class="node-code" x="70" y="624">audio [B, 1, N]</text>
 
@@ -520,8 +520,8 @@
               <text class="node-copy" x="548" y="559">mask → mean pool → tanh</text>
               <text class="node-copy" x="548" y="578">code embeddings: 384d</text>
               <text class="node-copy" x="548" y="597">Q streams summed / √Q</text>
-              <text class="node-copy" x="548" y="616">prepend BOS; shift right</text>
-              <text class="node-code" x="548" y="643">concat [384d + 256d]</text>
+              <text class="node-copy" x="548" y="616">regular BOS: K · start BOS: K+1</text>
+              <text class="node-code" x="548" y="643">input embeds K+2 · outputs K</text>
 
               <rect class="node node-green" x="816" y="484" width="204" height="194" rx="15"></rect>
               <text class="node-title" x="836" y="515">GRU prior</text>
@@ -534,7 +534,7 @@
 
               <rect class="node node-amber" x="1070" y="484" width="280" height="194" rx="15"></rect>
               <text class="node-title" x="1090" y="515">Next-code objective</text>
-              <text class="node-copy" x="1090" y="540">one 4,096-way head per Q</text>
+              <text class="node-copy" x="1090" y="540">one 2,048-way head per Q</text>
               <text class="node-copy" x="1090" y="559">cross-entropy vs target IDs</text>
               <text class="node-copy" x="1090" y="578">teacher-forced full sequence</text>
               <text class="node-copy" x="1090" y="603">AdamW · grad clip 1.0</text>
@@ -566,6 +566,11 @@
             <span class="detail-kicker">Optimizer</span>
             <h3>Stable mixed precision</h3>
             <p>CUDA autocast reduces eligible operation precision; gradient scaling, unscale-before-clipping, and AdamW keep updates stable.</p>
+          </article>
+          <article class="detail">
+            <span class="detail-kicker">BOS controls</span>
+            <h3>Two input-only starts</h3>
+            <p>Audio IDs 0–2047 can be predicted and decoded. Regular BOS 2048 and song-beginning BOS 2049 only seed the prior; neither can appear in generated audio codes.</p>
           </article>
         </div>
       </section>
@@ -617,12 +622,12 @@
 
               <rect class="node node-green" x="270" y="117" width="226" height="196" rx="15"></rect>
               <text class="node-title" x="290" y="148">Autoregressive GRU</text>
-              <text class="node-copy" x="290" y="173">start from BOS code</text>
+              <text class="node-copy" x="290" y="173">regular BOS K or start BOS K+1</text>
               <text class="node-copy" x="290" y="192">code emb + text condition</text>
               <text class="node-copy" x="290" y="211">3 layers · hidden 768</text>
               <text class="node-copy" x="290" y="230">one hidden-state step / token</text>
               <text class="node-copy" x="290" y="249">one output head per Q stream</text>
-              <text class="node-code" x="290" y="275">logits [B, Q, 4096]</text>
+              <text class="node-code" x="290" y="275">logits [B, Q, 2048]</text>
               <text class="node-code" x="290" y="292">no gradients · eval()</text>
 
               <rect class="node node-violet" x="544" y="117" width="222" height="196" rx="15"></rect>
@@ -683,8 +688,8 @@
         <div class="detail-grid">
           <article class="detail">
             <span class="detail-kicker">Context</span>
-            <h3>Text at every time step</h3>
-            <p>The same pooled 256d prompt vector is concatenated with each 384d code embedding, so the GRU remains conditioned throughout generation.</p>
+            <h3>BOS once, text throughout</h3>
+            <p>The selected BOS seeds an unprefixed clip, then real audio IDs take over. The pooled 256d prompt remains concatenated with each 384d code embedding throughout generation.</p>
           </article>
           <article class="detail">
             <span class="detail-kicker">Sampling</span>
@@ -694,7 +699,7 @@
           <article class="detail">
             <span class="detail-kicker">Guidance</span>
             <h3>Retrieval, not attention</h3>
-            <p>Optional guidance substitutes high-scoring code windows from prompt-matched real clips; it is a generation-time reranker outside the GRU.</p>
+            <p>Optional guidance substitutes real code windows outside the GRU. Structured inference keeps song-beginning sources in intro sections; this is separate from the BOS clip-count flag.</p>
           </article>
         </div>
       </section>
@@ -721,7 +726,7 @@
             </div>
             <div class="precision-row">
               <strong>INT64 IDs</strong>
-              <p>Text IDs, BOS, and latent code indices remain integer tensors. Quantization maps continuous 384d vectors to one of 4,096 discrete IDs per stream.</p>
+              <p>Text IDs, BOS, and latent code indices remain integer tensors. Audio IDs 0–2047 map to codebook vectors; BOS IDs 2048 and 2049 exist only in prior input embeddings.</p>
             </div>
           </div>
         </div>

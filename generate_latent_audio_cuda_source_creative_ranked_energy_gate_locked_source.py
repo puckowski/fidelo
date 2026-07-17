@@ -148,7 +148,7 @@ def main():
     candidate_entries = build_source_entries(
         args.prompt,
         tokenizer_model,
-        tokenizer_config,
+        prior_config,
         device,
         args.source_candidates,
         args.max_source_seconds,
@@ -165,6 +165,7 @@ def main():
     locked_source_file: Optional[str] = None
     clips = []
     for clip_idx in range(clip_count):
+        args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         clip_candidate_entries = filter_entries_to_locked_source(candidate_entries, locked_source_path)
         if locked_source_file is not None:
             print(f"Generating clip {clip_idx + 1}/{clip_count} using locked source {locked_source_file} on {device}...")

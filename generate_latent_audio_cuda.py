@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--prior-dir", default="latent_audio_prior_out")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--clip-count", type=int, default=1)
+    parser.add_argument("--beginning-bos-clips", type=int, default=1, help="Use beginning BOS for the first N generated clips. Set to 0 to disable it.")
     parser.add_argument("--duration-seconds", type=float, default=0.0, help="Target output duration in seconds. If set, overrides --clip-count.")
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=32)
@@ -209,6 +210,7 @@ def generate_guided_codes(args, prior_model, text_tokens, text_mask, config, can
             repetition_penalty=args.repetition_penalty,
             repetition_window=args.repetition_window,
             prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
+            song_beginning=bool(getattr(args, "song_beginning", False) and prefix_codes is None),
             device=device,
         ).squeeze(0).cpu()
 
@@ -254,7 +256,7 @@ def main():
         candidate_entries = build_guidance_entries(
             args.prompt,
             tokenizer_model,
-            tokenizer_config,
+            prior_config,
             device,
             args.guidance_candidates,
             target_num_quantizers=getattr(prior_model, "num_quantizers", 1),
@@ -264,6 +266,7 @@ def main():
 
     clips = []
     for clip_idx in range(clip_count):
+        args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         print(f"Generating latent clip {clip_idx + 1}/{clip_count} on {device}...")
         if candidate_entries:
             codes = generate_guided_codes(
@@ -285,6 +288,7 @@ def main():
                 top_p=args.top_p,
                 repetition_penalty=args.repetition_penalty,
                 repetition_window=args.repetition_window,
+                song_beginning=args.song_beginning,
                 device=device,
             )
         codes = codes.to(device=device, dtype=torch.long)

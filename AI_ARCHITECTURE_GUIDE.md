@@ -51,7 +51,7 @@ Some values in `index.html` describe code defaults, while the currently saved bu
 | GRU layers | 3 | 3 |
 | Text embedding size | 256 | 256 |
 
-This means the `4,096` labels in the visual page are a useful architectural example, but the current trained model chooses from `2,048` entries in each of two codebooks.
+The visual page now uses the current saved value of `2,048`. For another checkpoint, treat the saved `codebook_size` as $K$ and derive the BOS IDs from it.
 
 ## Important tensor notation
 
@@ -322,7 +322,26 @@ $$h_{code} = \frac{1}{\sqrt{Q}}\sum_{q=1}^{Q} E_q(c_q)$$
 
 The scaling keeps the combined magnitude from growing too quickly as more streams are added.
 
-A special **BOS**, or beginning-of-sequence, token tells the prior that generation is starting.
+### Regular audio IDs versus the two BOS IDs
+
+The prior input vocabulary has three roles. If the codebook size is $K$:
+
+| Token role | ID range | Produced by tokenizer? | Predicted by prior? | Decoded as audio? |
+|---|---:|---|---|---|
+| Regular audio tokens | $0$ through $K-1$ | Yes | Yes | Yes |
+| Regular BOS | $K$ | No | No | No |
+| Song-beginning BOS | $K+1$ | No | No | No |
+
+For the current saved model, $K=2{,}048$. Regular audio IDs are therefore `0..2047`, regular BOS is `2048`, and song-beginning BOS is `2049`.
+
+Both BOS values are **input-only control symbols** in each prior code-embedding table. The embedding tables have $K+2$ rows, but each output head still has exactly $K$ logits. Consequently, sampling can only produce real audio IDs, and neither BOS value is ever sent to the tokenizer decoder.
+
+The two BOS values mean different things:
+
+- **regular BOS** says “start an ordinary or continuation clip without a latent prefix”
+- **song-beginning BOS** says “start a clip taken from the actual beginning of a song”
+
+During training, the CSV column `song_beginning` selects the first input symbol independently for every sample. True values use song-beginning BOS; missing, false, or empty values use regular BOS. Beginning-labelled audio is cropped from sample zero so its label remains truthful. After the first step, both kinds of examples consume the same regular teacher-forced audio IDs, allowing the GRU state to transition naturally from an opening into ordinary musical development.
 
 ## 4. GRU sequence model
 
@@ -346,8 +365,9 @@ Each quantizer stream has a separate output head. With the current saved model, 
 During training, the true code sequence is shifted right:
 
 ```text
-Input:  BOS, code_1, code_2, ...
-Target: code_1, code_2, code_3, ...
+Regular clip input:    REGULAR_BOS,   code_1, code_2, ...
+Song-start clip input: BEGINNING_BOS, code_1, code_2, ...
+Both targets:                         code_1, code_2, code_3, ...
 ```
 
 This is **teacher forcing**: the model receives the real previous code instead of its own possibly incorrect prediction.
@@ -378,7 +398,11 @@ The tokenizer and prior must agree on codebook and quantizer structure. A prior 
 
 ## 1. Autoregressive sampling
 
-Generation starts with the BOS token. For every latent time step:
+Generation starts with regular BOS or song-beginning BOS. The generation scripts use song-beginning BOS for the first output clip by default. `--beginning-bos-clips N` applies it to the first $N$ clips, while `--beginning-bos-clips 0` disables it. This flag changes only the prior's initial input symbol; it does not insert an audible token into the output.
+
+When a generation window already has latent prefix codes, those real audio IDs establish the GRU state. The generator does not inject song-beginning BOS again inside that prefixed window.
+
+For every latent time step:
 
 1. embed the previous code or codes
 2. concatenate the pooled prompt vector
@@ -412,6 +436,8 @@ It:
 
 This is important: retrieval guidance is not neural attention and does not update model weights. It is an external generation-time selection procedure. Because it can insert token windows encoded from real dataset clips, output may follow retrieved material more directly than unguided prior sampling.
 
+BOS conditioning and retrieval metadata are separate controls. BOS changes the prior's initial hidden-state trajectory. Retrieval guidance selects real code windows from dataset audio. In the structured generator, sources marked `song_beginning=1` are restricted to intro sections, while body and outro sections use regular sources. Increasing `--beginning-bos-clips` does not make beginning-labelled retrieval audio eligible for later sections.
+
 ## 3. Decoding and final audio processing
 
 Predicted code IDs are looked up in the tokenizer codebooks. With multiple quantizers, stream vectors are summed. Post-quant blocks and the decoder turn those vectors into waveform audio.
@@ -442,7 +468,7 @@ Small half-precision gradients can underflow toward zero. `GradScaler` temporari
 
 ## Integer IDs
 
-Text IDs and audio code IDs use integer tensors, normally `int64`. An ID is just an index into an embedding or codebook table; it is not a continuous audio value.
+Text IDs and audio code IDs use integer tensors, normally `int64`. An ID is just an index into an embedding or codebook table; it is not a continuous audio value. Regular audio IDs index both prior embeddings and tokenizer codebooks. The two BOS IDs index only the prior's expanded input embeddings and are outside the decoder's valid audio-token range.
 
 # How to diagnose the system
 
@@ -497,6 +523,10 @@ In a broad sense, the prior behaves like a small language model over audio token
 ## Does one audio token equal one note?
 
 No. A token is the nearest learned latent vector at a short time step. It may represent a mixture of timbre, phase, local rhythm, pitch content, and texture. Token meanings are learned and are not assigned musical labels.
+
+## Does song-beginning BOS contain or decode an intro sound?
+
+No. It is a learned prior input embedding, not an audio codebook entry. It influences which first real audio IDs the GRU predicts and how its hidden state develops. Any audible intro behavior comes from regular audio tokens that the model learned to associate with that control symbol.
 
 ## Why not generate waveform samples directly?
 

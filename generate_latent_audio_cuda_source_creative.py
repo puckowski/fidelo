@@ -61,6 +61,7 @@ def parse_args():
     parser.add_argument("--prior-dir", default="latent_audio_prior_out")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--clip-count", type=int, default=1)
+    parser.add_argument("--beginning-bos-clips", type=int, default=1, help="Use beginning BOS for the first N generated clips. Set to 0 to disable it.")
     parser.add_argument(
         "--duration-seconds",
         type=float,
@@ -344,6 +345,7 @@ def generate_source_creative_codes(args, prior_model, text_tokens, text_mask, co
             repetition_penalty=args.repetition_penalty,
             repetition_window=args.repetition_window,
             prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
+            song_beginning=bool(getattr(args, "song_beginning", False) and prefix_codes is None),
             device=device,
         ).squeeze(0).cpu()
 
@@ -408,7 +410,7 @@ def main():
     candidate_entries = build_source_entries(
         args.prompt,
         tokenizer_model,
-        tokenizer_config,
+        prior_config,
         device,
         args.source_candidates,
         args.max_source_seconds,
@@ -423,6 +425,7 @@ def main():
 
     clips = []
     for clip_idx in range(clip_count):
+        args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         print(f"Generating source-creative latent clip {clip_idx + 1}/{clip_count} on {device}...")
         codes = generate_source_creative_codes(
             args,

@@ -144,16 +144,24 @@ class SimpleWordTokenizer:
         return cls(payload["stoi"])
 
 
-def load_dataset_items(metadata_csv: str, audio_dir: str) -> List[Dict[str, str]]:
-    items: List[Dict[str, str]] = []
+def load_dataset_items(metadata_csv: str, audio_dir: str) -> List[Dict]:
+    items: List[Dict] = []
     with open(metadata_csv, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             file_name = row.get("file", "")
             text = row.get("text", "")
+            song_beginning = str(row.get("song_beginning", "")).strip().lower() in {
+                "1", "true", "yes", "y", "beginning", "start",
+            }
             path = os.path.join(audio_dir, file_name)
             if os.path.isfile(path):
-                items.append({"file": file_name, "text": text, "path": path})
+                items.append({
+                    "file": file_name,
+                    "text": text,
+                    "path": path,
+                    "song_beginning": song_beginning,
+                })
     return items
 
 
@@ -212,10 +220,18 @@ def load_audio_mono(path: str, sample_rate: int) -> torch.Tensor:
     return waveform.clamp(-1.0, 1.0)
 
 
-def crop_or_pad(waveform: torch.Tensor, clip_samples: int, random_crop: bool = True) -> torch.Tensor:
+def crop_or_pad(
+    waveform: torch.Tensor,
+    clip_samples: int,
+    random_crop: bool = True,
+    crop_from_start: bool = False,
+) -> torch.Tensor:
     total = waveform.shape[-1]
     if total > clip_samples:
-        start = random.randint(0, total - clip_samples) if random_crop else max(0, (total - clip_samples) // 2)
+        if crop_from_start:
+            start = 0
+        else:
+            start = random.randint(0, total - clip_samples) if random_crop else max(0, (total - clip_samples) // 2)
         return waveform[:, start:start + clip_samples]
     if total < clip_samples:
         return F.pad(waveform, (0, clip_samples - total))
@@ -234,7 +250,7 @@ def match_audio_length(waveform: torch.Tensor, target_length: int) -> torch.Tens
 class AudioTextDataset(Dataset):
     def __init__(
         self,
-        items: List[Dict[str, str]],
+        items: List[Dict],
         config: LatentAudioConfig,
         text_tokenizer: Optional[SimpleWordTokenizer] = None,
         random_crop: bool = True,
@@ -255,11 +271,18 @@ class AudioTextDataset(Dataset):
             item = self.items[current_index]
             try:
                 waveform = load_audio_mono(item["path"], self.config.sample_rate)
-                waveform = crop_or_pad(waveform, self.config.clip_samples, random_crop=self.random_crop)
+                song_beginning = bool(item.get("song_beginning", False))
+                waveform = crop_or_pad(
+                    waveform,
+                    self.config.clip_samples,
+                    random_crop=self.random_crop and not song_beginning,
+                    crop_from_start=song_beginning,
+                )
                 output = {
                     "waveform": waveform.float(),
                     "path": item["path"],
                     "text": item["text"],
+                    "song_beginning": song_beginning,
                 }
                 if self.text_tokenizer is not None:
                     text_tokens = self.text_tokenizer.encode(item["text"], self.config.max_text_tokens)
@@ -469,13 +492,17 @@ def latent_bos_token(config: LatentAudioConfig) -> int:
     return config.codebook_size
 
 
+def latent_beginning_bos_token(config: LatentAudioConfig) -> int:
+    return config.codebook_size + 1
+
+
 class TextConditionedLatentPrior(nn.Module):
     def __init__(self, text_vocab_size: int, config: LatentAudioConfig):
         super().__init__()
         self.config = config
         self.num_quantizers = max(1, int(config.num_quantizers))
         self.code_embeddings = nn.ModuleList(
-            [nn.Embedding(config.codebook_size + 1, config.code_dim) for _ in range(self.num_quantizers)]
+            [nn.Embedding(config.codebook_size + 2, config.code_dim) for _ in range(self.num_quantizers)]
         )
         self.text_embedding = nn.Embedding(text_vocab_size, config.text_embed_dim)
         self.text_proj = nn.Linear(config.text_embed_dim, config.text_embed_dim)
@@ -530,10 +557,19 @@ class TextConditionedLatentPrior(nn.Module):
         logits = torch.stack([head(hidden_states) for head in self.output_heads], dim=1)
         return logits
 
-    def bos_codes(self, batch_size: int, device: torch.device) -> torch.Tensor:
+    def bos_codes(
+        self,
+        batch_size: int,
+        device: torch.device,
+        song_beginning: bool = False,
+    ) -> torch.Tensor:
         return torch.full(
             (batch_size, self.num_quantizers),
-            fill_value=latent_bos_token(self.config),
+            fill_value=(
+                latent_beginning_bos_token(self.config)
+                if song_beginning
+                else latent_bos_token(self.config)
+            ),
             dtype=torch.long,
             device=device,
         )
@@ -642,6 +678,7 @@ class TextConditionedLatentPrior(nn.Module):
         repetition_penalty: float = 1.0,
         repetition_window: int = 128,
         prefix_codes: Optional[torch.Tensor] = None,
+        song_beginning: bool = False,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         self.eval()
@@ -650,7 +687,7 @@ class TextConditionedLatentPrior(nn.Module):
         text_mask = text_mask.to(device)
         hidden = None
         text_cond = self.encode_text(text_tokens, text_mask)
-        current = self.bos_codes(text_tokens.shape[0], device)
+        current = self.bos_codes(text_tokens.shape[0], device, song_beginning=song_beginning)
         outputs: List[torch.Tensor] = []
         history: List[torch.Tensor] = []
 
@@ -779,7 +816,18 @@ def load_latent_prior_state_dict(model: TextConditionedLatentPrior, state: Dict[
     for key, value in state.items():
         remapped_key = _remap_prior_state_key(key)
         if remapped_key in model_state:
-            filtered_state[remapped_key] = value
+            target = model_state[remapped_key]
+            if (
+                remapped_key.startswith("code_embeddings.")
+                and value.dim() == target.dim() == 2
+                and value.shape[1:] == target.shape[1:]
+                and value.shape[0] <= target.shape[0]
+            ):
+                expanded = target.clone()
+                expanded[:value.shape[0]] = value
+                filtered_state[remapped_key] = expanded
+            else:
+                filtered_state[remapped_key] = value
 
     missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
     disallowed_missing = [

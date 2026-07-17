@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--prior-dir", default="latent_audio_prior_out")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--clip-count", type=int, default=1)
+    parser.add_argument("--beginning-bos-clips", type=int, default=1, help="Use beginning BOS for the first N generated clips. Set to 0 to disable it.")
     parser.add_argument(
         "--duration-seconds",
         type=float,
@@ -49,6 +50,12 @@ def parse_args():
     parser.add_argument("--clip-energy-check-seconds", type=float, default=1.0, help="Analyze generated clips in chunks of this length when checking for silence.")
     parser.add_argument("--min-clip-rms", type=float, default=0.02, help="Reject a generated clip if any analysis chunk falls below this RMS threshold.")
     parser.add_argument("--min-clip-peak", type=float, default=0.06, help="Reject a generated clip if any analysis chunk falls below this peak threshold.")
+    parser.add_argument("--beginning-window-energy-check-top", type=int, default=None, help="Beginning-BOS override for --window-energy-check-top.")
+    parser.add_argument("--beginning-min-window-rms", type=float, default=None, help="Beginning-BOS override for --min-window-rms.")
+    parser.add_argument("--beginning-min-window-peak", type=float, default=None, help="Beginning-BOS override for --min-window-peak.")
+    parser.add_argument("--beginning-clip-energy-check-seconds", type=float, default=None, help="Beginning-BOS override for --clip-energy-check-seconds.")
+    parser.add_argument("--beginning-min-clip-rms", type=float, default=None, help="Beginning-BOS override for --min-clip-rms.")
+    parser.add_argument("--beginning-min-clip-peak", type=float, default=None, help="Beginning-BOS override for --min-clip-peak.")
     parser.add_argument("--min-clip-median-rms", type=float, default=0.0, help="Reject a generated clip if the median analysis-chunk RMS is below this threshold. Use this to require at least medium overall intensity.")
     parser.add_argument("--clip-retry-count", type=int, default=4, help="How many times to retry a clip with new seeds if it fails the audibility check.")
     parser.add_argument("--theme-seconds", type=float, default=1.66, help="How long to keep one randomly chosen source theme before switching to another top-N source file.")
@@ -164,6 +171,18 @@ def build_song_sections(clip_count: int, args) -> List[str]:
 
 def build_section_args(args, section_name: str):
     clip_args = argparse.Namespace(**vars(args))
+    if clip_args.song_beginning:
+        beginning_overrides = {
+            "window_energy_check_top": args.beginning_window_energy_check_top,
+            "min_window_rms": args.beginning_min_window_rms,
+            "min_window_peak": args.beginning_min_window_peak,
+            "clip_energy_check_seconds": args.beginning_clip_energy_check_seconds,
+            "min_clip_rms": args.beginning_min_clip_rms,
+            "min_clip_peak": args.beginning_min_clip_peak,
+        }
+        for setting_name, override in beginning_overrides.items():
+            if override is not None:
+                setattr(clip_args, setting_name, override)
     if section_name == "intro":
         clip_args.theme_top_n = max(1, int(args.intro_theme_top_n))
         clip_args.theme_seconds = max(0.1, float(args.intro_theme_seconds))
@@ -184,20 +203,23 @@ def build_section_args(args, section_name: str):
 
 
 def build_section_candidate_entries(candidate_entries: List[Dict], anchor_entry: Optional[Dict], section_name: str, args) -> List[Dict]:
+    beginning_entries = [entry for entry in candidate_entries if entry.get("song_beginning", False)]
+    regular_entries = [entry for entry in candidate_entries if not entry.get("song_beginning", False)]
     if section_name == "intro":
-        return candidate_entries[:max(1, int(args.intro_theme_top_n))]
+        intro_pool = beginning_entries or regular_entries
+        return intro_pool[:max(1, int(args.intro_theme_top_n))]
     if section_name == "outro":
-        if anchor_entry is None:
-            return candidate_entries[:max(1, int(args.outro_theme_top_n))]
+        if anchor_entry is None or anchor_entry.get("song_beginning", False):
+            return regular_entries[:max(1, int(args.outro_theme_top_n))]
         limited = [anchor_entry]
-        for entry in candidate_entries:
+        for entry in regular_entries:
             if entry.get("file") == anchor_entry.get("file"):
                 continue
             limited.append(entry)
             if len(limited) >= max(1, int(args.outro_theme_top_n)):
                 break
         return limited
-    return candidate_entries
+    return regular_entries
 
 
 def apply_song_endcaps(audio: torch.Tensor, sample_rate: int, intro_fade_ms: int, outro_fade_ms: int) -> torch.Tensor:
@@ -393,9 +415,11 @@ def generate_source_creative_ranked_codes(
                     transition_steps_done = transition_steps_total
                 recent_theme_entries.append(current_theme_entry)
                 recent_theme_entries = recent_theme_entries[-max(1, args.theme_repeat_window):]
+                source_type = "beginning" if current_theme_entry.get("song_beginning", False) else "regular"
                 print(
                     "Selected theme "
-                    f"{current_theme_entry['file']} for up to {min(args.theme_seconds, config.clip_seconds):.2f}s"
+                    f"{current_theme_entry['file']} source_type={source_type} "
+                    f"for up to {min(args.theme_seconds, config.clip_seconds):.2f}s"
                 )
 
         prefix_codes = None
@@ -601,7 +625,7 @@ def main():
     candidate_entries = build_source_entries(
         args.prompt,
         tokenizer_model,
-        tokenizer_config,
+        prior_config,
         device,
         args.source_candidates,
         args.max_source_seconds,
@@ -612,26 +636,41 @@ def main():
 
     print(f"Loaded {len(candidate_entries)} source candidates")
     for entry in candidate_entries:
-        print(f"- {entry['file']} | score={entry['match_score']:.2f} | {entry['text']}")
+        source_type = "beginning" if entry.get("song_beginning", False) else "regular"
+        print(
+            f"- {entry['file']} | source_type={source_type} "
+            f"| score={entry['match_score']:.2f} | {entry['text']}"
+        )
 
     section_names = build_song_sections(clip_count, args)
-    anchor_entry = candidate_entries[0] if candidate_entries else None
+    anchor_entry = next(
+        (entry for entry in candidate_entries if not entry.get("song_beginning", False)),
+        None,
+    )
     if anchor_entry is not None:
         print(f"Structural anchor theme: {anchor_entry['file']}")
 
     clips = []
     for clip_idx in range(clip_count):
+        args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         section_name = section_names[clip_idx] if clip_idx < len(section_names) else "body"
         section_entries = build_section_candidate_entries(candidate_entries, anchor_entry, section_name, args)
+        effective_clip_args = build_section_args(args, section_name)
+        energy_profile = "beginning" if args.song_beginning else "regular"
         print(
             f"Generating {section_name} sticky crossfaded source-creative latent clip "
-            f"{clip_idx + 1}/{clip_count} on {device}..."
+            f"{clip_idx + 1}/{clip_count} on {device} "
+            f"energy_profile={energy_profile} "
+            f"window_rms={effective_clip_args.min_window_rms:.4f} "
+            f"window_peak={effective_clip_args.min_window_peak:.4f} "
+            f"clip_rms={effective_clip_args.min_clip_rms:.4f} "
+            f"clip_peak={effective_clip_args.min_clip_peak:.4f}..."
         )
         accepted_waveform = None
         retry_count = max(1, int(args.clip_retry_count))
 
         for retry_idx in range(retry_count):
-            clip_args = build_section_args(args, section_name)
+            clip_args = argparse.Namespace(**vars(effective_clip_args))
             clip_args.seed = args.seed + clip_idx * 1009 + retry_idx * 7919
             codes, segment_ranges = generate_source_creative_ranked_codes(
                 clip_args,
@@ -657,10 +696,10 @@ def main():
             chunk_energies = measure_audio_chunk_energies(
                 candidate_waveform,
                 tokenizer_config.sample_rate,
-                args.clip_energy_check_seconds,
+                clip_args.clip_energy_check_seconds,
             )
             loudness_summary = summarize_clip_loudness(chunk_energies)
-            if clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args) and clip_has_sufficient_loudness(chunk_energies, args):
+            if clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, clip_args) and clip_has_sufficient_loudness(chunk_energies, clip_args):
                 accepted_waveform = candidate_waveform
                 quietest_accepted_chunk = min(
                     chunk_energies,
@@ -678,7 +717,7 @@ def main():
                 break
 
             worst_chunk = min(chunk_energies, key=lambda item: (item["rms"], item["peak"]))
-            if not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, args):
+            if not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, clip_args):
                 print(
                     "Rejected low-energy clip "
                     f"{clip_idx + 1} section={section_name} attempt {retry_idx + 1}/{retry_count} "

@@ -13,6 +13,7 @@ from latent_audio_token_pipeline import (
     LatentAudioConfig,
     SimpleWordTokenizer,
     TextConditionedLatentPrior,
+    latent_beginning_bos_token,
     latent_bos_token,
     load_audio_tokenizer_bundle,
     load_dataset_items,
@@ -59,24 +60,36 @@ def get_device(allow_cpu: bool) -> torch.device:
     raise RuntimeError("CUDA is required for latent prior training. Re-run with --allow-cpu to override.")
 
 
-def build_code_inputs_targets(indices: torch.Tensor, config: LatentAudioConfig):
+def resolve_prior_checkpoint(path: str) -> str:
+    if not os.path.isdir(path):
+        return path
+    best_path = os.path.join(path, "best_latent_prior.pt")
+    if os.path.isfile(best_path):
+        return best_path
+    return os.path.join(path, "latent_prior.pt")
+
+
+def build_code_inputs_targets(
+    indices: torch.Tensor,
+    config: LatentAudioConfig,
+    song_beginning: torch.Tensor = None,
+):
+    beginning_mask = torch.zeros(indices.shape[0], dtype=torch.bool, device=indices.device)
+    if song_beginning is not None:
+        beginning_mask = song_beginning.to(device=indices.device, dtype=torch.bool)
+    bos_values = torch.where(
+        beginning_mask,
+        latent_beginning_bos_token(config),
+        latent_bos_token(config),
+    )
+
     if indices.dim() == 2:
-        bos = torch.full(
-            (indices.shape[0], 1),
-            fill_value=latent_bos_token(config),
-            dtype=torch.long,
-            device=indices.device,
-        )
+        bos = bos_values.unsqueeze(-1)
         input_codes = torch.cat([bos, indices[:, :-1]], dim=1)
         target_codes = indices.long()
         return input_codes, target_codes
 
-    bos = torch.full(
-        (indices.shape[0], indices.shape[1], 1),
-        fill_value=latent_bos_token(config),
-        dtype=torch.long,
-        device=indices.device,
-    )
+    bos = bos_values.view(-1, 1, 1).expand(-1, indices.shape[1], -1)
     input_codes = torch.cat([bos, indices[..., :-1]], dim=-1)
     target_codes = indices.long()
     return input_codes, target_codes
@@ -103,8 +116,9 @@ def evaluate(audio_tokenizer, prior, loader, device, config):
         waveform = batch["waveform"].to(device, non_blocking=True)
         text_tokens = batch["text_tokens"].to(device, non_blocking=True)
         text_mask = batch["text_mask"].to(device, non_blocking=True)
+        song_beginning = batch["song_beginning"].to(device, non_blocking=True)
         codes = encode_training_codes(audio_tokenizer, waveform)
-        input_codes, target_codes = build_code_inputs_targets(codes, config)
+        input_codes, target_codes = build_code_inputs_targets(codes, config, song_beginning)
         logits, _ = prior(input_codes, text_tokens, text_mask)
         loss = compute_prior_loss(logits, target_codes)
         losses.append(float(loss.item()))
@@ -128,11 +142,22 @@ def main():
         raise RuntimeError("No valid audio files found for latent prior training.")
     print(f"Loaded {len(items)} prompt/audio pairs")
 
-    text_tokenizer = SimpleWordTokenizer.build(
-        [item["text"] for item in items],
-        min_freq=args.min_word_freq,
-        max_vocab_size=args.max_vocab_size,
-    )
+    prior_checkpoint = ""
+    if args.finetune_from:
+        prior_checkpoint = resolve_prior_checkpoint(args.finetune_from)
+        text_tokenizer_path = os.path.join(os.path.dirname(prior_checkpoint) or ".", "text_tokenizer.json")
+        if not os.path.isfile(text_tokenizer_path):
+            raise RuntimeError(
+                "Fine-tuning requires text_tokenizer.json next to the prior checkpoint so existing word IDs remain stable."
+            )
+        text_tokenizer = SimpleWordTokenizer.load(text_tokenizer_path)
+        print(f"Reusing text tokenizer from {text_tokenizer_path}")
+    else:
+        text_tokenizer = SimpleWordTokenizer.build(
+            [item["text"] for item in items],
+            min_freq=args.min_word_freq,
+            max_vocab_size=args.max_vocab_size,
+        )
     print(f"Text vocab size: {text_tokenizer.vocab_size}")
 
     config.metadata_csv = args.metadata_csv
@@ -168,10 +193,6 @@ def main():
 
     prior = TextConditionedLatentPrior(text_tokenizer.vocab_size, config).to(device)
     if args.finetune_from:
-        prior_checkpoint = args.finetune_from
-        if os.path.isdir(prior_checkpoint):
-            best_path = os.path.join(prior_checkpoint, "best_latent_prior.pt")
-            prior_checkpoint = best_path if os.path.isfile(best_path) else os.path.join(prior_checkpoint, "latent_prior.pt")
         state = safe_torch_load(prior_checkpoint, device)
         load_latent_prior_state_dict(prior, state)
         print(f"Fine-tuning latent prior from {prior_checkpoint}")
@@ -193,10 +214,11 @@ def main():
             waveform = batch["waveform"].to(device, non_blocking=True)
             text_tokens = batch["text_tokens"].to(device, non_blocking=True)
             text_mask = batch["text_mask"].to(device, non_blocking=True)
+            song_beginning = batch["song_beginning"].to(device, non_blocking=True)
 
             with torch.no_grad():
                 codes = encode_training_codes(audio_tokenizer, waveform)
-            input_codes, target_codes = build_code_inputs_targets(codes, config)
+            input_codes, target_codes = build_code_inputs_targets(codes, config, song_beginning)
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits, _ = prior(input_codes, text_tokens, text_mask)

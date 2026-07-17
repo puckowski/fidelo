@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--prior-dir", default="latent_audio_prior_out")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--clip-count", type=int, default=1)
+    parser.add_argument("--beginning-bos-clips", type=int, default=1, help="Use beginning BOS for the first N generated clips. Set to 0 to disable it.")
     parser.add_argument(
         "--duration-seconds",
         type=float,
@@ -162,9 +163,22 @@ def build_source_entries(
         scored.append((score, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
 
-    chosen = [pair for pair in scored[:limit] if pair[0] > 0]
-    if not chosen:
-        chosen = scored[:limit]
+    eligible = [pair for pair in scored if pair[0] > 0]
+    if not eligible:
+        eligible = scored
+    chosen = eligible[:limit]
+    for song_beginning in (False, True):
+        if any(bool(item.get("song_beginning", False)) == song_beginning for _, item in chosen):
+            continue
+        category_match = next(
+            (
+                pair for pair in scored
+                if bool(pair[1].get("song_beginning", False)) == song_beginning
+            ),
+            None,
+        )
+        if category_match is not None:
+            chosen.append(category_match)
 
     entries: List[Dict] = []
     for score, item in chosen:
@@ -181,6 +195,7 @@ def build_source_entries(
                     "path": item["path"],
                     "file": item["file"],
                     "match_score": score,
+                    "song_beginning": bool(item.get("song_beginning", False)),
                 }
             )
         except Exception as exc:
@@ -350,7 +365,11 @@ def generate_rank_relaxed_window(args, prior_model, text_tokens, text_mask, num_
     text_mask = text_mask.to(device)
     hidden = None
     text_cond = prior_model.encode_text(text_tokens, text_mask)
-    current = prior_model.bos_codes(text_tokens.shape[0], device)
+    current = prior_model.bos_codes(
+        text_tokens.shape[0],
+        device,
+        song_beginning=bool(getattr(args, "song_beginning", False) and prefix_codes is None),
+    )
     outputs: List[torch.Tensor] = []
     history: List[torch.Tensor] = []
 
@@ -529,7 +548,7 @@ def main():
     candidate_entries = build_source_entries(
         args.prompt,
         tokenizer_model,
-        tokenizer_config,
+        prior_config,
         device,
         args.source_candidates,
         args.max_source_seconds,
@@ -544,6 +563,7 @@ def main():
 
     clips = []
     for clip_idx in range(clip_count):
+        args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         print(f"Generating source-creative-ranked latent clip {clip_idx + 1}/{clip_count} on {device}...")
         clip_args = argparse.Namespace(**vars(args))
         clip_args.seed = args.seed + clip_idx * 1009

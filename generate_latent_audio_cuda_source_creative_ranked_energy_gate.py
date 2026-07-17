@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--prior-dir", default="latent_audio_prior_out")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--clip-count", type=int, default=1)
+    parser.add_argument("--beginning-bos-clips", type=int, default=1, help="Use beginning BOS for the first N generated clips. Set to 0 to disable it.")
     parser.add_argument(
         "--duration-seconds",
         type=float,
@@ -267,7 +268,7 @@ def main():
     candidate_entries = build_source_entries(
         args.prompt,
         tokenizer_model,
-        tokenizer_config,
+        prior_config,
         device,
         args.source_candidates,
         args.max_source_seconds,
@@ -282,6 +283,7 @@ def main():
 
     clips = []
     for clip_idx in range(clip_count):
+        args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         print(f"Generating source-creative-ranked latent clip {clip_idx + 1}/{clip_count} on {device}...")
         accepted_waveform = None
         retry_count = max(1, int(args.clip_retry_count))
