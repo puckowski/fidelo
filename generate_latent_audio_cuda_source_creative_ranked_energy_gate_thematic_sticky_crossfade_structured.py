@@ -50,6 +50,10 @@ def parse_args():
     parser.add_argument("--clip-energy-check-seconds", type=float, default=1.0, help="Analyze generated clips in chunks of this length when checking for silence.")
     parser.add_argument("--min-clip-rms", type=float, default=0.02, help="Reject a generated clip if any analysis chunk falls below this RMS threshold.")
     parser.add_argument("--min-clip-peak", type=float, default=0.06, help="Reject a generated clip if any analysis chunk falls below this peak threshold.")
+    parser.add_argument("--dropout-check-seconds", type=float, default=0.25, help="Analyze overlapping short windows of this length to catch quiet portions hidden inside larger analysis chunks. Set to 0 to disable.")
+    parser.add_argument("--dropout-hop-seconds", type=float, default=0.125, help="Spacing between short dropout-analysis windows.")
+    parser.add_argument("--min-dropout-rms", type=float, default=None, help="Short-window RMS floor. Defaults to --min-clip-rms.")
+    parser.add_argument("--min-dropout-peak", type=float, default=None, help="Short-window peak floor. Defaults to --min-clip-peak.")
     parser.add_argument("--beginning-window-energy-check-top", type=int, default=None, help="Beginning-BOS override for --window-energy-check-top.")
     parser.add_argument("--beginning-min-window-rms", type=float, default=None, help="Beginning-BOS override for --min-window-rms.")
     parser.add_argument("--beginning-min-window-peak", type=float, default=None, help="Beginning-BOS override for --min-window-peak.")
@@ -83,6 +87,7 @@ def parse_args():
     parser.add_argument("--outro-rank-choice-prob", type=float, default=0.08, help="Lower non-top-token sampling in the outro.")
     parser.add_argument("--song-intro-fade-ms", type=int, default=220, help="Apply a short fade-in to the final song output.")
     parser.add_argument("--song-outro-fade-ms", type=int, default=1800, help="Apply a longer fade-out to the final song output.")
+    parser.add_argument("--beginning-to-regular-crossfade-seconds", type=float, default=2.0, help="Crossfade duration when accepted beginning-BOS clips transition to regular clips.")
     parser.add_argument("--creative-span-count", type=int, default=5, help="How many prior-driven spans to inject per window.")
     parser.add_argument("--creative-span-min", type=int, default=8)
     parser.add_argument("--creative-span-max", type=int, default=40)
@@ -134,6 +139,36 @@ def clip_has_sufficient_loudness(chunk_energies: List[Dict[str, float]], args) -
         return True
     loudness = summarize_clip_loudness(chunk_energies)
     return loudness["median_rms"] >= min_clip_median_rms
+
+
+def find_quiet_audio_window(audio: torch.Tensor, sample_rate: int, args) -> Optional[Dict[str, float]]:
+    window_seconds = max(0.0, float(getattr(args, "dropout_check_seconds", 0.0)))
+    if window_seconds <= 0.0:
+        return None
+
+    flattened = audio.detach().cpu().float().flatten()
+    if flattened.numel() == 0:
+        return {"start_seconds": 0.0, "rms": 0.0, "peak": 0.0}
+
+    window_samples = max(1, int(round(window_seconds * sample_rate)))
+    hop_seconds = max(1.0 / sample_rate, float(getattr(args, "dropout_hop_seconds", window_seconds / 2.0)))
+    hop_samples = max(1, int(round(hop_seconds * sample_rate)))
+    min_rms_arg = getattr(args, "min_dropout_rms", None)
+    min_peak_arg = getattr(args, "min_dropout_peak", None)
+    min_rms = max(0.0, float(args.min_clip_rms if min_rms_arg is None else min_rms_arg))
+    min_peak = max(0.0, float(args.min_clip_peak if min_peak_arg is None else min_peak_arg))
+    final_start = max(0, flattened.numel() - window_samples)
+    starts = list(range(0, final_start + 1, hop_samples))
+    if not starts or starts[-1] != final_start:
+        starts.append(final_start)
+
+    for start in starts:
+        chunk = flattened[start:start + window_samples]
+        rms = chunk.pow(2).mean().sqrt().item()
+        peak = chunk.abs().max().item()
+        if rms < min_rms or peak < min_peak:
+            return {"start_seconds": start / float(sample_rate), "rms": rms, "peak": peak}
+    return None
 
 
 def clamp_ratio(value: float) -> float:
@@ -263,19 +298,19 @@ def choose_theme_entry(
     if len(working) == 1:
         return working[0]
 
-    recent_entries = recent_entries[-max(0, repeat_window):]
-    scores = []
+    recent_entries = recent_entries[-repeat_window:] if repeat_window > 0 else []
+    logits = []
     for entry in working:
         base_score = float(entry.get("match_score", 0.0)) + 0.25
         repeat_score = 0.0
         for age, previous in enumerate(reversed(recent_entries)):
             if previous.get("file") == entry.get("file"):
                 repeat_score += repeat_decay ** age
-        weight = max(0.05, base_score) * (1.0 + max(0.0, repeat_bonus) * repeat_score)
-        scores.append(weight)
+        repeat_multiplier = 1.0 + max(0.0, repeat_bonus) * repeat_score
+        logits.append(math.log(max(0.05, base_score)) + math.log(repeat_multiplier))
 
-    max_score = max(scores)
-    weights = [math.exp((score - max_score) / max(1e-6, float(temperature))) for score in scores]
+    max_logit = max(logits)
+    weights = [math.exp((logit - max_logit) / max(1e-6, float(temperature))) for logit in logits]
     total = sum(weights)
     pick = rng.random() * total
     running = 0.0
@@ -372,7 +407,8 @@ def generate_source_creative_ranked_codes(
     candidate_entries,
     device: torch.device,
     source_rng: random.Random,
-) -> Tuple[torch.Tensor, List[Tuple[int, int]]]:
+    recent_theme_entries: Optional[List[Dict]] = None,
+) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[Dict]]:
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
@@ -383,7 +419,7 @@ def generate_source_creative_ranked_codes(
     current_theme_entry: Optional[Dict] = None
     previous_theme_entry: Optional[Dict] = None
     remaining_theme_steps = 0
-    recent_theme_entries: List[Dict] = []
+    theme_history = list(recent_theme_entries or [])
     segment_ranges: List[Tuple[int, int]] = []
     segment_start = 0
     transition_steps_total = max(0, int(round((max(0, args.theme_crossfade_ms) / 1000.0) * steps_per_second)))
@@ -402,7 +438,7 @@ def generate_source_creative_ranked_codes(
                 window_size,
                 source_rng,
                 args.theme_temperature,
-                recent_theme_entries,
+                theme_history,
                 args.theme_repeat_window,
                 args.theme_repeat_bonus,
                 args.theme_repeat_decay,
@@ -413,8 +449,11 @@ def generate_source_creative_ranked_codes(
                     transition_steps_done = 0
                 else:
                     transition_steps_done = transition_steps_total
-                recent_theme_entries.append(current_theme_entry)
-                recent_theme_entries = recent_theme_entries[-max(1, args.theme_repeat_window):]
+                if args.theme_repeat_window > 0:
+                    theme_history.append(current_theme_entry)
+                    theme_history = theme_history[-args.theme_repeat_window:]
+                else:
+                    theme_history = []
                 source_type = "beginning" if current_theme_entry.get("song_beginning", False) else "regular"
                 print(
                     "Selected theme "
@@ -526,7 +565,7 @@ def generate_source_creative_ranked_codes(
     if code_step_count(generated) > segment_start:
         segment_ranges.append((segment_start, code_step_count(generated)))
 
-    return generated.unsqueeze(0).to(device), segment_ranges
+    return generated.unsqueeze(0).to(device), segment_ranges, theme_history
 
 
 def decode_and_stitch_segments(
@@ -596,6 +635,29 @@ def crossfade_theme_waveforms(
     return out
 
 
+def stitch_song_clips(
+    waveforms: List[torch.Tensor],
+    beginning_flags: List[bool],
+    sample_rate: int,
+    default_fade_ms: int,
+    beginning_to_regular_crossfade_seconds: float,
+) -> torch.Tensor:
+    if not waveforms:
+        raise ValueError("No waveforms provided for song stitching")
+    if len(waveforms) != len(beginning_flags):
+        raise ValueError("Waveform and beginning-flag counts do not match")
+
+    transition_fade_ms = max(0, int(round(beginning_to_regular_crossfade_seconds * 1000.0)))
+    output = waveforms[0].clone()
+    for clip_idx, waveform in enumerate(waveforms[1:], start=1):
+        is_beginning_transition = beginning_flags[clip_idx - 1] and not beginning_flags[clip_idx]
+        fade_ms = transition_fade_ms if is_beginning_transition else default_fade_ms
+        output = base.stitch_waveforms([output, waveform], sample_rate, fade_ms=fade_ms)
+        if is_beginning_transition:
+            print(f"Beginning-to-regular clip crossfade: {fade_ms}ms at accepted clip boundary {clip_idx}/{clip_idx + 1}")
+    return output
+
+
 def main():
     args = parse_args()
     start_time = time.perf_counter()
@@ -651,6 +713,8 @@ def main():
         print(f"Structural anchor theme: {anchor_entry['file']}")
 
     clips = []
+    clip_beginning_flags: List[bool] = []
+    recent_theme_entries: List[Dict] = []
     for clip_idx in range(clip_count):
         args.song_beginning = clip_idx < max(0, args.beginning_bos_clips)
         section_name = section_names[clip_idx] if clip_idx < len(section_names) else "body"
@@ -672,7 +736,7 @@ def main():
         for retry_idx in range(retry_count):
             clip_args = argparse.Namespace(**vars(effective_clip_args))
             clip_args.seed = args.seed + clip_idx * 1009 + retry_idx * 7919
-            codes, segment_ranges = generate_source_creative_ranked_codes(
+            codes, segment_ranges, attempted_theme_entries = generate_source_creative_ranked_codes(
                 clip_args,
                 prior_model,
                 tokenizer_model,
@@ -682,6 +746,7 @@ def main():
                 section_entries,
                 device,
                 source_rng,
+                recent_theme_entries,
             )
             codes = codes.to(device=device, dtype=torch.long)
             waveform = decode_and_stitch_segments(
@@ -699,8 +764,10 @@ def main():
                 clip_args.clip_energy_check_seconds,
             )
             loudness_summary = summarize_clip_loudness(chunk_energies)
-            if clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, clip_args) and clip_has_sufficient_loudness(chunk_energies, clip_args):
+            quiet_window = find_quiet_audio_window(candidate_waveform, tokenizer_config.sample_rate, clip_args)
+            if quiet_window is None and clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, clip_args) and clip_has_sufficient_loudness(chunk_energies, clip_args):
                 accepted_waveform = candidate_waveform
+                recent_theme_entries = attempted_theme_entries
                 quietest_accepted_chunk = min(
                     chunk_energies,
                     key=lambda item: (item["rms"], item["peak"]),
@@ -717,7 +784,14 @@ def main():
                 break
 
             worst_chunk = min(chunk_energies, key=lambda item: (item["rms"], item["peak"]))
-            if not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, clip_args):
+            if quiet_window is not None:
+                print(
+                    "Rejected clip with quiet portion "
+                    f"{clip_idx + 1} section={section_name} attempt {retry_idx + 1}/{retry_count} "
+                    f"at={quiet_window['start_seconds']:.3f}s "
+                    f"short_rms={quiet_window['rms']:.4f} short_peak={quiet_window['peak']:.4f}"
+                )
+            elif not clip_has_sufficient_energy(candidate_waveform, tokenizer_config.sample_rate, clip_args):
                 print(
                     "Rejected low-energy clip "
                     f"{clip_idx + 1} section={section_name} attempt {retry_idx + 1}/{retry_count} "
@@ -736,6 +810,7 @@ def main():
             continue
 
         clips.append(accepted_waveform)
+        clip_beginning_flags.append(bool(args.song_beginning))
 
     if not clips:
         raise RuntimeError("All generated clips failed the energy gate. Relax the thresholds or increase --clip-retry-count.")
@@ -743,9 +818,15 @@ def main():
     print(f"Accepted {len(clips)} clip(s) for final output")
 
     final_fade_ms = max(int(args.fade_ms), int(args.theme_crossfade_ms))
-    output = base.stitch_waveforms(clips, tokenizer_config.sample_rate, fade_ms=final_fade_ms)
+    output = stitch_song_clips(
+        clips,
+        clip_beginning_flags,
+        tokenizer_config.sample_rate,
+        final_fade_ms,
+        args.beginning_to_regular_crossfade_seconds,
+    )
     if len(clips) > 1:
-        print(f"Final clip stitch crossfade: {final_fade_ms}ms across {len(clips)} clips")
+        print(f"Default final clip stitch crossfade: {final_fade_ms}ms across {len(clips)} clips")
     if target_samples is not None:
         output = output[..., :target_samples]
     output = output - output.mean(dim=-1, keepdim=True)
