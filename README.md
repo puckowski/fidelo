@@ -10,6 +10,54 @@ python .\train_latent_audio_tokenizer.py --clip-seconds 3.33
 python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
 python .\train_latent_audio_tokenizer.py --finetune-from  latent_audio_tokenizer_out  --lr 5e-5 --weight-decay 5e-6 --grad-accum-steps 4 --commitment-cost 0.2 --clip-seconds 5 --num-quantizers 2 --epochs 5
 
+
+python .\prepare_beginning_transition_manifest.py `
+  --metadata-csv .\dataset\metadata.csv `
+  --audio-dir .\dataset\audio `
+  --output .\dataset\beginning_transition_manifest.csv `
+  --intro-seconds 10 `
+  --body-seconds 9
+
+python.exe `
+  .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_intro_body_continued.py `
+  --tokenizer-dir .\3.33smodel\9smodel `
+  --prior-dir .\3.33smodel\9smodel\prior_transition_finetuned `
+  --prompt "your prompt" `
+  --duration-seconds 45 `
+  --continuation-prefix-seconds 2.0 `
+  --output .\inference_output\continued_song.wav
+
+The continued generator carries the exact GRU hidden state across internal windows and accepted output clips. After source retrieval and token fusion, it advances the state with the actual accepted tokens, so recurrent context matches the audio codes that are retained. Every retry branches from the last accepted state; a rejected retry does not alter later generation. `--continuation-prefix-seconds` remains useful for source-window continuity, while the GRU itself uses persistent state by default. Add `--disable-persistent-gru-state` to restore prefix-replay behavior for comparison.
+
+For a thematic transition that guides token generation instead of blending two completed clips, use the latent-guided token variant:
+
+```powershell
+python.exe `
+  .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_intro_body_latent_guided_tokens.py `
+  --tokenizer-dir .\3.33smodel\9smodel `
+  --prior-dir .\3.33smodel\9smodel\prior_transition_finetuned `
+  --prompt "metal" `
+  --duration-seconds 45 `
+  --latent-transition-seconds 4.0 `
+  --latent-motif-match-seconds 0.75 `
+  --latent-transition-min-ac-rms 0.008 `
+  --latent-overlap-neighborhood-seconds 0.08 `
+  --latent-overlap-neighborhood-candidates 9 `
+  --latent-overlap-continuity-weight 0.35 `
+  --latent-overlap-offset-weight 0.05 `
+  --latent-overlap-progression-weight 0.5 `
+  --clip-crossfade-ms 900 `
+  --section-crossfade-ms 1800 `
+  --continuation-prefix-seconds 2.0 `
+  --output .\inference_output\latent_guided_song.wav
+```
+
+This variant retrieves regular-source motifs by similarity to the accepted intro tail and rejects quiet motif windows before constructing the transition. It creates a smoothly evolving latent target across the aligned intro and regular overlap. A global path optimizer selects intact residual-VQ pairs from nearby observed positions, scoring target distance, adjacent latent jumps, distance from aligned source timing, and skips or repeats within each source. The path starts in the intro, switches to the regular motif exactly once, and cannot return to the intro. It never averages token IDs, combines quantizer streams from different candidates, or inserts arbitrary prior tokens inside the overlap.
+
+`--latent-overlap-neighborhood-seconds` bounds how far selection may move from each aligned source position, and `--latent-overlap-neighborhood-candidates` controls how many positions per source are evaluated. Increase `--latent-overlap-continuity-weight` to favor a cleaner splice boundary, `--latent-overlap-offset-weight` to stay near aligned timing, and `--latent-overlap-progression-weight` to discourage skipped or repeated source tokens. Set the neighborhood to `0` for a strict splice between two contiguous observed runs. These options are separate from the source-window retrieval option `--continuity-weight`. Selection is deterministic for fixed inputs.
+
+Every selected pair is committed to persistent GRU state before ordinary body generation resumes. Accepted clips are decoded separately and joined with equal-power waveform overlaps. The saved output preserves the internal themed segment fades controlled by `--theme-crossfade-ms`, rather than applying them only during energy checking. `--clip-crossfade-ms` controls every ordinary clip/sequence boundary. `--section-crossfade-ms` controls the intro-to-regular overlap and is centered on the selected token path's first regular-motif pair. The duplicated intro-like prefix of the body transition is skipped before mixing, so the fade spans the actual musical handoff instead of ending before regular tokens arrive. Duration-based generation automatically requests enough clips to compensate for these overlaps before trimming to the requested output length. Mean-centered RMS validation rejects quiet static or DC-like transition output; tune that check with `--latent-transition-min-ac-rms`.
+  
 ### Song-beginning conditioning
 
 The latent prior supports a dedicated input-only BOS token for clips taken from the actual start of a song. Add a `song_beginning` column to the prior-training metadata:
@@ -154,6 +202,75 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
   --outro-rank-choice-prob 0.18 `
   --song-intro-fade-ms 220 `
   --song-outro-fade-ms 2200
+  
+  python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_intro_body_latent_guided_tokens.py `
+  --prompt "synthwave" `
+  --seed 178 `
+  --duration-seconds 45 `
+  --repetition-penalty 1.03 `
+  --repetition-window 256 `
+  --rank-choice-prob 0.08 `
+  --rank-choice-top 2 `
+  --rank-choice-temperature 0.30 `
+  --source-candidates 16 `
+  --max-source-seconds 30 `
+  --proposal-weight 0.70 `
+  --continuity-weight 5.0 `
+  --match-weight 0.65 `
+  --scan-step-divisor 8 `
+  --creative-span-count 2 `
+  --creative-span-min 8 `
+  --creative-span-max 20 `
+  --creative-token-mix 0.04 `
+  --theme-top-n 2 `
+  --theme-temperature 0.20 `
+  --theme-repeat-window 8 `
+  --theme-repeat-bonus 7.0 `
+  --theme-repeat-decay 0.85 `
+  --theme-crossfade-ms 600 `
+  --intro-ratio 0.20 `
+  --intro-theme-top-n 1 `
+  --intro-theme-temperature 0.15 `
+  --intro-repeat-bonus 8.0 `
+  --intro-creative-token-mix 0.02 `
+  --intro-rank-choice-prob 0.03 `
+  --song-intro-fade-ms 450 `
+  --clip-retry-count 8 `
+  --intro-body-prior-seconds 0 `
+  --intro-body-average-seconds 0.4 `
+  --intro-body-overlap-seconds 1.5 `
+  --intro-body-source-strength 1.0 `
+  --fade-ms 1200 `
+  --latent-transition-seconds 4.0 `
+  --latent-motif-match-seconds 0.75 `
+  --latent-guidance-strength 4.0 `
+  --latent-guidance-candidate-top-k 4 `
+  --latent-guidance-temperature 0 `
+  --continuation-prefix-seconds 2.0 `
+  --source-strength 0.92 `
+  --source-window 512 `
+  --source-overlap 512 `
+  --temperature 0.60 `
+  --top-k 4 `
+  --top-p 0.85 `
+  --intro-theme-seconds 4.0 `
+  --theme-seconds 4.0 `
+  --window-energy-check-top 12 `
+  --min-window-rms 0.0035 `
+  --min-window-peak 0.015 `
+  --clip-energy-check-seconds 2.0 `
+  --min-clip-rms 0.006 `
+  --min-clip-peak 0.028 `
+    --window-energy-check-top 64 `
+  --latent-overlap-neighborhood-seconds 0 `
+  --latent-overlap-neighborhood-candidates 1 `
+  --latent-overlap-continuity-weight 2.0 `
+  --latent-overlap-progression-weight 5.0 `
+  --latent-transition-min-ac-rms 0.008 `   
+  --latent-transition-seconds 6.0 `
+  --section-crossfade-ms 3500 `
+  --theme-crossfade-ms 900 `
+  --clip-crossfade-ms 1500
   
 ## Model V2
 

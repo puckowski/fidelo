@@ -104,7 +104,9 @@ make_output_name = base.make_output_name
 build_source_entries = base.build_source_entries
 find_source_window_candidates = base.find_source_window_candidates
 generate_rank_relaxed_window = base.generate_rank_relaxed_window
+advance_recurrent_state_with_codes = base.advance_recurrent_state_with_codes
 fuse_source_and_proposal_window = base.fuse_source_and_proposal_window
+fuse_contiguous_source_to_proposal_window = base.fuse_contiguous_source_to_proposal_window
 measure_window_energy = energy_gate.measure_window_energy
 measure_audio_chunk_energies = energy_gate.measure_audio_chunk_energies
 clip_has_sufficient_energy = energy_gate.clip_has_sufficient_energy
@@ -157,6 +159,7 @@ def find_quiet_audio_window(audio: torch.Tensor, sample_rate: int, args) -> Opti
     min_peak_arg = getattr(args, "min_dropout_peak", None)
     min_rms = max(0.0, float(args.min_clip_rms if min_rms_arg is None else min_rms_arg))
     min_peak = max(0.0, float(args.min_clip_peak if min_peak_arg is None else min_peak_arg))
+    min_ac_rms = max(0.0, float(getattr(args, "min_dropout_ac_rms", 0.0)))
     final_start = max(0, flattened.numel() - window_samples)
     starts = list(range(0, final_start + 1, hop_samples))
     if not starts or starts[-1] != final_start:
@@ -166,13 +169,44 @@ def find_quiet_audio_window(audio: torch.Tensor, sample_rate: int, args) -> Opti
         chunk = flattened[start:start + window_samples]
         rms = chunk.pow(2).mean().sqrt().item()
         peak = chunk.abs().max().item()
-        if rms < min_rms or peak < min_peak:
-            return {"start_seconds": start / float(sample_rate), "rms": rms, "peak": peak}
+        ac_rms = (chunk - chunk.mean()).pow(2).mean().sqrt().item()
+        if rms < min_rms or peak < min_peak or ac_rms < min_ac_rms:
+            return {
+                "start_seconds": start / float(sample_rate),
+                "rms": rms,
+                "peak": peak,
+                "ac_rms": ac_rms,
+            }
     return None
 
 
 def clamp_ratio(value: float) -> float:
     return max(0.0, min(0.45, float(value)))
+
+
+def apply_latent_guidance_reference_fallback(
+    chosen_new: torch.Tensor,
+    reference_codes: Optional[torch.Tensor],
+    guidance_start: int,
+    guided_steps: int,
+    retry_index: int,
+    fallback_after_retry: int,
+) -> torch.Tensor:
+    if (
+        reference_codes is None
+        or guided_steps <= 0
+        or retry_index < fallback_after_retry
+    ):
+        return chosen_new
+    reference = reference_codes
+    while reference.dim() > chosen_new.dim():
+        reference = reference.squeeze(0)
+    reference_slice = reference[..., guidance_start:guidance_start + guided_steps]
+    if reference_slice.shape[-1] != guided_steps:
+        return chosen_new
+    result = chosen_new.clone()
+    result[..., :guided_steps] = reference_slice.to(device=result.device, dtype=result.dtype)
+    return result
 
 
 def build_song_sections(clip_count: int, args) -> List[str]:
@@ -408,7 +442,10 @@ def generate_source_creative_ranked_codes(
     device: torch.device,
     source_rng: random.Random,
     recent_theme_entries: Optional[List[Dict]] = None,
-) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[Dict]]:
+    continuation_prefix_codes: Optional[torch.Tensor] = None,
+    recurrent_state: Optional[Dict] = None,
+    return_recurrent_state: bool = False,
+):
     total_steps = config.latent_steps
     window_size = max(32, min(args.source_window, total_steps))
     overlap_size = max(0, min(args.source_overlap, window_size // 2))
@@ -424,6 +461,12 @@ def generate_source_creative_ranked_codes(
     segment_start = 0
     transition_steps_total = max(0, int(round((max(0, args.theme_crossfade_ms) / 1000.0) * steps_per_second)))
     transition_steps_done = transition_steps_total
+    current_recurrent_state = recurrent_state
+    external_prefix = None
+    if continuation_prefix_codes is not None and continuation_prefix_codes.numel() > 0:
+        external_prefix = continuation_prefix_codes.detach().to(device="cpu", dtype=torch.long)
+        if external_prefix.dim() > (2 if getattr(prior_model, "num_quantizers", 1) > 1 else 1):
+            external_prefix = external_prefix.squeeze(0)
 
     while code_step_count(generated) < total_steps:
         if current_theme_entry is None or remaining_theme_steps <= 0:
@@ -432,17 +475,29 @@ def generate_source_creative_ranked_codes(
                 segment_start = code_step_count(generated)
 
             previous_theme_entry = current_theme_entry
-            current_theme_entry = choose_theme_entry(
-                candidate_entries,
-                args.theme_top_n,
-                window_size,
-                source_rng,
-                args.theme_temperature,
-                theme_history,
-                args.theme_repeat_window,
-                args.theme_repeat_bonus,
-                args.theme_repeat_decay,
-            )
+            forced_initial_theme_file = getattr(args, "forced_initial_theme_file", None)
+            current_theme_entry = None
+            if code_step_count(generated) == 0 and forced_initial_theme_file:
+                current_theme_entry = next(
+                    (
+                        entry
+                        for entry in candidate_entries
+                        if entry.get("file") == forced_initial_theme_file
+                    ),
+                    None,
+                )
+            if current_theme_entry is None:
+                current_theme_entry = choose_theme_entry(
+                    candidate_entries,
+                    args.theme_top_n,
+                    window_size,
+                    source_rng,
+                    args.theme_temperature,
+                    theme_history,
+                    args.theme_repeat_window,
+                    args.theme_repeat_bonus,
+                    args.theme_repeat_decay,
+                )
             remaining_theme_steps = theme_steps
             if current_theme_entry is not None:
                 if previous_theme_entry is not None and previous_theme_entry.get("file") != current_theme_entry.get("file"):
@@ -462,9 +517,15 @@ def generate_source_creative_ranked_codes(
                 )
 
         prefix_codes = None
+        generation_prefix_codes = None
         prefix_len = 0
         if overlap_size > 0 and code_step_count(generated) > 0:
             prefix_codes = extract_code_tail(generated, overlap_size)
+            generation_prefix_codes = prefix_codes
+            prefix_len = code_step_count(prefix_codes)
+        elif overlap_size > 0 and external_prefix is not None:
+            prefix_codes = extract_code_tail(external_prefix, overlap_size)
+            generation_prefix_codes = external_prefix
             prefix_len = code_step_count(prefix_codes)
 
         max_new_steps = window_size if prefix_len == 0 else (window_size - prefix_len)
@@ -474,18 +535,40 @@ def generate_source_creative_ranked_codes(
             remaining_theme_steps = 0
             continue
 
-        generated_new = generate_rank_relaxed_window(
-            args,
+        generation_args = args
+        if generation_prefix_codes is not external_prefix:
+            generation_args = argparse.Namespace(**vars(args))
+            generation_args.prefix_song_beginning = False
+
+        generated_new, proposal_state = generate_rank_relaxed_window(
+            generation_args,
             prior_model,
             text_tokens,
             text_mask,
             new_steps,
-            prefix_codes=(None if prefix_codes is None else ensure_batched_codes(prefix_codes)),
+            prefix_codes=(
+                None
+                if generation_prefix_codes is None
+                else ensure_batched_codes(generation_prefix_codes)
+            ),
             device=device,
             rng=rng,
-        ).squeeze(0).cpu()
+            recurrent_state=current_recurrent_state,
+            return_recurrent_state=True,
+            tokenizer_model=tokenizer_model,
+            latent_guidance_target=getattr(generation_args, "latent_guidance_target", None),
+            latent_guidance_reference_codes=getattr(
+                generation_args,
+                "latent_guidance_reference_codes",
+                None,
+            ),
+            latent_guidance_offset=code_step_count(generated),
+        )
+        generated_new = generated_new.squeeze(0).cpu()
 
         proposal_full = generated_new if prefix_codes is None else concat_code_sequences(prefix_codes.cpu(), generated_new)
+        initial_handoff_steps = max(0, int(getattr(args, "initial_handoff_steps", 0)))
+        use_initial_handoff = code_step_count(generated) < initial_handoff_steps
         chosen = choose_theme_window(
             proposal_full,
             prefix_codes,
@@ -513,20 +596,26 @@ def generate_source_creative_ranked_codes(
                 device,
             )
             if previous_chosen is not None:
-                previous_fused = fuse_source_and_proposal_window(
-                    proposal_full,
-                    previous_chosen["window"],
-                    prefix_len,
-                    args,
-                    rng,
-                )
-                current_fused = fuse_source_and_proposal_window(
-                    proposal_full,
-                    chosen["window"],
-                    prefix_len,
-                    args,
-                    rng,
-                )
+                if use_initial_handoff:
+                    handoff_args = (
+                        prefix_len,
+                        code_step_count(generated),
+                        initial_handoff_steps,
+                        float(getattr(args, "initial_source_fraction", 0.8)),
+                    )
+                    previous_fused = fuse_contiguous_source_to_proposal_window(
+                        proposal_full, previous_chosen["window"], *handoff_args
+                    )
+                    current_fused = fuse_contiguous_source_to_proposal_window(
+                        proposal_full, chosen["window"], *handoff_args
+                    )
+                else:
+                    previous_fused = fuse_source_and_proposal_window(
+                        proposal_full, previous_chosen["window"], prefix_len, args, rng
+                    )
+                    current_fused = fuse_source_and_proposal_window(
+                        proposal_full, chosen["window"], prefix_len, args, rng
+                    )
                 blended_window = blend_theme_windows(
                     previous_fused,
                     current_fused,
@@ -538,26 +627,94 @@ def generate_source_creative_ranked_codes(
                 )
                 chosen_new = slice_code_steps(blended_window, prefix_len, prefix_len + new_steps)
             else:
-                fused_window = fuse_source_and_proposal_window(
+                if use_initial_handoff:
+                    fused_window = fuse_contiguous_source_to_proposal_window(
+                        proposal_full,
+                        chosen["window"],
+                        prefix_len,
+                        code_step_count(generated),
+                        initial_handoff_steps,
+                        float(getattr(args, "initial_source_fraction", 0.8)),
+                    )
+                else:
+                    fused_window = fuse_source_and_proposal_window(
+                        proposal_full, chosen["window"], prefix_len, args, rng
+                    )
+                chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
+        elif chosen is not None:
+            if use_initial_handoff:
+                fused_window = fuse_contiguous_source_to_proposal_window(
                     proposal_full,
                     chosen["window"],
                     prefix_len,
-                    args,
-                    rng,
+                    code_step_count(generated),
+                    initial_handoff_steps,
+                    float(getattr(args, "initial_source_fraction", 0.8)),
                 )
-                chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
-        elif chosen is not None:
-            fused_window = fuse_source_and_proposal_window(
-                proposal_full,
-                chosen["window"],
-                prefix_len,
-                args,
-                rng,
-            )
+            else:
+                fused_window = fuse_source_and_proposal_window(
+                    proposal_full, chosen["window"], prefix_len, args, rng
+                )
             chosen_new = slice_code_steps(fused_window, prefix_len, prefix_len + new_steps)
         else:
             chosen_new = generated_new
 
+        latent_guidance_target = getattr(generation_args, "latent_guidance_target", None)
+        valid_overlap_codes = getattr(
+            generation_args,
+            "latent_guidance_valid_overlap_codes",
+            None,
+        )
+        guidance_codes = valid_overlap_codes if valid_overlap_codes is not None else latent_guidance_target
+        if guidance_codes is not None:
+            guidance_start = code_step_count(generated)
+            guided_steps = min(
+                new_steps,
+                max(0, guidance_codes.shape[-1] - guidance_start),
+            )
+            if guided_steps > 0:
+                if valid_overlap_codes is not None:
+                    valid_codes = valid_overlap_codes
+                    while valid_codes.dim() > chosen_new.dim():
+                        valid_codes = valid_codes.squeeze(0)
+                    chosen_new[..., :guided_steps] = valid_codes[
+                        ..., guidance_start:guidance_start + guided_steps
+                    ].to(device=chosen_new.device, dtype=chosen_new.dtype)
+                    if guidance_start == 0:
+                        print(
+                            "Using only observed intro/motif residual-VQ pairs for "
+                            f"{guided_steps} initial transition steps"
+                        )
+                else:
+                    chosen_new[..., :guided_steps] = generated_new[..., :guided_steps]
+                    retry_index = int(getattr(generation_args, "generation_retry_index", 0))
+                    fallback_after_retry = max(
+                        1,
+                        int(getattr(generation_args, "latent_guidance_fallback_after_retry", 1)),
+                    )
+                    chosen_new = apply_latent_guidance_reference_fallback(
+                        chosen_new,
+                        getattr(generation_args, "latent_guidance_reference_codes", None),
+                        guidance_start,
+                        guided_steps,
+                        retry_index,
+                        fallback_after_retry,
+                    )
+                    if guidance_start == 0 and retry_index >= fallback_after_retry:
+                        print(
+                            "Using exact retrieved motif tokens after rejected latent-guided "
+                            f"attempt {retry_index}"
+                        )
+
+        current_recurrent_state = advance_recurrent_state_with_codes(
+            prior_model,
+            text_tokens,
+            text_mask,
+            chosen_new,
+            device,
+            proposal_state["generation_start_state"],
+            args.repetition_window,
+        )
         generated = concat_code_sequences(generated, chosen_new)
         remaining_theme_steps -= new_steps
         transition_steps_done = min(transition_steps_total, transition_steps_done + new_steps)
@@ -565,7 +722,10 @@ def generate_source_creative_ranked_codes(
     if code_step_count(generated) > segment_start:
         segment_ranges.append((segment_start, code_step_count(generated)))
 
-    return generated.unsqueeze(0).to(device), segment_ranges, theme_history
+    result = (generated.unsqueeze(0).to(device), segment_ranges, theme_history)
+    if return_recurrent_state:
+        return (*result, current_recurrent_state)
+    return result
 
 
 def decode_and_stitch_segments(

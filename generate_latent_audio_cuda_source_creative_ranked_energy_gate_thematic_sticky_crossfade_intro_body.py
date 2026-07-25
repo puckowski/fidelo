@@ -9,7 +9,7 @@ import torch
 import generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured as structured
 
 
-def parse_args():
+def parse_args(configure_parser=None):
     parser = argparse.ArgumentParser(
         description="Generate prompt-conditioned audio with sticky source themes, energy gates, and intro/body structure."
     )
@@ -81,6 +81,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output", default="")
     parser.add_argument("--allow-cpu", action="store_true")
+    if configure_parser is not None:
+        configure_parser(parser)
     return parser.parse_args()
 
 

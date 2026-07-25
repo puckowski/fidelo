@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import itertools
 import math
 import random
 import re
@@ -358,22 +359,155 @@ def sample_rank_relaxed_next_code(logits: torch.Tensor, args, rng: random.Random
     return torch.stack(next_codes, dim=0)
 
 
+def sample_latent_guided_next_code(
+    logits: torch.Tensor,
+    target_latent: torch.Tensor,
+    tokenizer_model,
+    args,
+    history: Optional[List[torch.Tensor]] = None,
+    reference_code: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if logits.dim() != 3:
+        raise ValueError(f"Expected logits with shape [B, Q, K], got {tuple(logits.shape)}")
+    if target_latent.dim() != 2 or target_latent.shape[0] != logits.shape[0]:
+        raise ValueError(
+            f"Expected target latent with shape [B, C], got {tuple(target_latent.shape)}"
+        )
+    if logits.shape[1] > len(tokenizer_model.quantizers):
+        raise ValueError("Prior has more code streams than the tokenizer")
+
+    temperature = max(float(args.temperature), 1e-5)
+    filtered = filter_logits(logits / temperature, args.top_k, args.top_p)
+    candidate_top_k = max(1, int(getattr(args, "latent_guidance_candidate_top_k", 4)))
+    guidance_strength = max(0.0, float(getattr(args, "latent_guidance_strength", 4.0)))
+    magnitude_weight = max(0.0, float(getattr(args, "latent_guidance_magnitude_weight", 0.5)))
+    repeat_penalty = max(0.0, float(getattr(args, "latent_guidance_repeat_penalty", 0.25)))
+    guidance_temperature = max(0.0, float(getattr(args, "latent_guidance_temperature", 0.0)))
+    if int(getattr(args, "generation_retry_index", 0)) > 0:
+        guidance_temperature = max(
+            guidance_temperature,
+            max(0.0, float(getattr(args, "latent_guidance_retry_temperature", 0.2))),
+        )
+    selected_batches = []
+    recent_history = None
+    if history:
+        recent_history = torch.stack(history[-max(1, int(args.repetition_window)):], dim=-1)
+
+    for batch_idx in range(filtered.shape[0]):
+        stream_candidates = []
+        for quantizer_idx in range(filtered.shape[1]):
+            row = filtered[batch_idx, quantizer_idx]
+            valid_indices = torch.nonzero(torch.isfinite(row), as_tuple=False).squeeze(-1)
+            if valid_indices.numel() == 0:
+                valid_indices = torch.argmax(logits[batch_idx, quantizer_idx]).view(1)
+                valid_logits = logits[batch_idx, quantizer_idx, valid_indices] / temperature
+            else:
+                valid_logits = row[valid_indices]
+            keep_count = min(candidate_top_k, valid_indices.numel())
+            top_values, top_positions = torch.topk(valid_logits, k=keep_count)
+            stream_candidates.append(valid_indices[top_positions])
+
+        combinations = list(itertools.product(*[range(items.numel()) for items in stream_candidates]))
+        combination_codes = [
+            torch.stack(
+                [stream_candidates[quantizer_idx][position] for quantizer_idx, position in enumerate(positions)]
+            )
+            for positions in combinations
+        ]
+        if reference_code is not None:
+            reference = reference_code[batch_idx].to(device=logits.device, dtype=torch.long)
+            if reference.numel() == logits.shape[1] and all(
+                0 <= int(reference[quantizer_idx]) < logits.shape[-1]
+                for quantizer_idx in range(reference.numel())
+            ) and not any(torch.equal(codes, reference) for codes in combination_codes):
+                combination_codes.append(reference)
+
+        combination_scores = []
+        full_log_probs = torch.log_softmax(logits[batch_idx] / temperature, dim=-1)
+        normalized_target = torch.nn.functional.normalize(
+            target_latent[batch_idx].float(), dim=0, eps=1e-8
+        )
+        target_norm = target_latent[batch_idx].float().norm().clamp_min(1e-8)
+        for codes in combination_codes:
+            candidate_latent = torch.stack(
+                [
+                    tokenizer_model.quantizers[quantizer_idx].codebook.weight[codes[quantizer_idx]]
+                    for quantizer_idx in range(codes.numel())
+                ],
+                dim=0,
+            ).sum(dim=0)
+            latent_similarity = torch.dot(
+                torch.nn.functional.normalize(candidate_latent.float(), dim=0, eps=1e-8),
+                normalized_target,
+            )
+            magnitude_error = torch.abs(
+                torch.log(candidate_latent.float().norm().clamp_min(1e-8) / target_norm)
+            )
+            prior_score = torch.stack(
+                [full_log_probs[quantizer_idx, codes[quantizer_idx]] for quantizer_idx in range(codes.numel())]
+            ).mean()
+            if recent_history is None:
+                recent_count = prior_score.new_tensor(0.0)
+            else:
+                recent_count = (
+                    recent_history[batch_idx].to(codes.device) == codes.unsqueeze(-1)
+                ).all(dim=0).sum().to(dtype=prior_score.dtype)
+            combination_scores.append(
+                prior_score
+                + guidance_strength * (latent_similarity - magnitude_weight * magnitude_error)
+                - repeat_penalty * recent_count
+            )
+
+        scores = torch.stack(combination_scores)
+        if guidance_temperature <= 1e-6:
+            selected_idx = int(torch.argmax(scores).item())
+        else:
+            selected_idx = int(torch.multinomial(torch.softmax(scores / guidance_temperature, dim=0), 1).item())
+        selected_batches.append(combination_codes[selected_idx])
+
+    return torch.stack(selected_batches, dim=0)
+
+
 @torch.no_grad()
-def generate_rank_relaxed_window(args, prior_model, text_tokens, text_mask, num_steps: int, prefix_codes: Optional[torch.Tensor], device: torch.device, rng: random.Random) -> torch.Tensor:
+def generate_rank_relaxed_window(
+    args,
+    prior_model,
+    text_tokens,
+    text_mask,
+    num_steps: int,
+    prefix_codes: Optional[torch.Tensor],
+    device: torch.device,
+    rng: random.Random,
+    recurrent_state: Optional[Dict] = None,
+    return_recurrent_state: bool = False,
+    tokenizer_model=None,
+    latent_guidance_target: Optional[torch.Tensor] = None,
+    latent_guidance_reference_codes: Optional[torch.Tensor] = None,
+    latent_guidance_offset: int = 0,
+):
     prior_model.eval()
     text_tokens = text_tokens.to(device)
     text_mask = text_mask.to(device)
-    hidden = None
     text_cond = prior_model.encode_text(text_tokens, text_mask)
-    current = prior_model.bos_codes(
-        text_tokens.shape[0],
-        device,
-        song_beginning=bool(getattr(args, "song_beginning", False) and prefix_codes is None),
-    )
+    if recurrent_state is not None:
+        hidden = recurrent_state["hidden"].to(device)
+        current = recurrent_state["current"].to(device=device, dtype=torch.long)
+        history = [item.to(device=device, dtype=torch.long) for item in recurrent_state.get("history", [])]
+    else:
+        hidden = None
+        current = prior_model.bos_codes(
+            text_tokens.shape[0],
+            device,
+            song_beginning=bool(
+                getattr(args, "song_beginning", False)
+                if prefix_codes is None
+                else getattr(args, "prefix_song_beginning", False)
+            ),
+        )
+        history = []
     outputs: List[torch.Tensor] = []
-    history: List[torch.Tensor] = []
 
-    if prefix_codes is not None and prefix_codes.numel() > 0:
+    if recurrent_state is None and prefix_codes is not None and prefix_codes.numel() > 0:
         prefix_codes = prefix_codes.to(device=device, dtype=torch.long)
         if prefix_codes.dim() == 2 and getattr(prior_model, "num_quantizers", 1) == 1:
             prefix_codes = prefix_codes.unsqueeze(1)
@@ -382,11 +516,38 @@ def generate_rank_relaxed_window(args, prior_model, text_tokens, text_mask, num_
             current = prefix_codes[..., step_idx]
             history.append(current)
 
-    for _ in range(num_steps):
+    generation_start_state = {
+        "hidden": None if hidden is None else hidden.detach(),
+        "current": current.detach(),
+        "history": [item.detach() for item in history[-max(1, args.repetition_window):]],
+    }
+
+    for step_idx in range(num_steps):
         logits, hidden = prior_model.forward_step(current, text_cond, hidden)
         logits = apply_repetition_penalty(logits, history, args.repetition_penalty, args.repetition_window)
 
-        if args.temperature <= 0:
+        target_idx = latent_guidance_offset + step_idx
+        use_latent_guidance = (
+            tokenizer_model is not None
+            and latent_guidance_target is not None
+            and 0 <= target_idx < latent_guidance_target.shape[-1]
+        )
+        if use_latent_guidance:
+            reference_code = None
+            if (
+                latent_guidance_reference_codes is not None
+                and target_idx < latent_guidance_reference_codes.shape[-1]
+            ):
+                reference_code = latent_guidance_reference_codes[..., target_idx].to(device)
+            next_code = sample_latent_guided_next_code(
+                logits,
+                latent_guidance_target[..., target_idx].to(device),
+                tokenizer_model,
+                args,
+                history,
+                reference_code,
+            )
+        elif args.temperature <= 0:
             next_code = torch.argmax(logits, dim=-1)
         else:
             next_code = sample_rank_relaxed_next_code(logits, args, rng)
@@ -396,9 +557,46 @@ def generate_rank_relaxed_window(args, prior_model, text_tokens, text_mask, num_
         current = next_code
 
     generated = torch.stack(outputs, dim=-1)
+    next_state = {
+        "hidden": hidden.detach(),
+        "current": current.detach(),
+        "history": [item.detach() for item in history[-max(1, args.repetition_window):]],
+        "generation_start_state": generation_start_state,
+    }
     if getattr(prior_model, "num_quantizers", 1) == 1:
-        return generated[:, 0, :]
+        generated = generated[:, 0, :]
+    if return_recurrent_state:
+        return generated, next_state
     return generated
+
+
+@torch.no_grad()
+def advance_recurrent_state_with_codes(
+    prior_model,
+    text_tokens: torch.Tensor,
+    text_mask: torch.Tensor,
+    accepted_codes: torch.Tensor,
+    device: torch.device,
+    initial_state: Dict,
+    repetition_window: int,
+) -> Dict:
+    accepted_codes = ensure_batched_codes(accepted_codes).to(device=device, dtype=torch.long)
+    if accepted_codes.dim() == 2 and getattr(prior_model, "num_quantizers", 1) == 1:
+        accepted_codes = accepted_codes.unsqueeze(1)
+    initial_hidden = initial_state["hidden"]
+    hidden = None if initial_hidden is None else initial_hidden.to(device)
+    current = initial_state["current"].to(device=device, dtype=torch.long)
+    history = [item.to(device=device, dtype=torch.long) for item in initial_state.get("history", [])]
+    text_cond = prior_model.encode_text(text_tokens.to(device), text_mask.to(device))
+    for step_idx in range(accepted_codes.shape[-1]):
+        _, hidden = prior_model.forward_step(current, text_cond, hidden)
+        current = accepted_codes[..., step_idx]
+        history.append(current)
+    return {
+        "hidden": hidden.detach(),
+        "current": current.detach(),
+        "history": [item.detach() for item in history[-max(1, repetition_window):]],
+    }
 
 
 def inject_creative_spans(mixed_new: torch.Tensor, proposal_new: torch.Tensor, args, rng: random.Random) -> torch.Tensor:
@@ -452,6 +650,28 @@ def fuse_source_and_proposal_window(
         fused_new = source_new.clone()
         keep_source_mask = torch.rand(code_step_count(source_new)) < source_strength
         fused_new[..., ~keep_source_mask] = creative[..., ~keep_source_mask]
+
+    if prefix_len > 0:
+        anchored[..., prefix_len:] = fused_new
+        return anchored
+    return fused_new
+
+
+def fuse_contiguous_source_to_proposal_window(
+    proposal_full: torch.Tensor,
+    source_window: torch.Tensor,
+    prefix_len: int,
+    transition_offset: int,
+    transition_steps: int,
+    source_fraction: float,
+) -> torch.Tensor:
+    anchored = source_window.clone()
+    source_new = source_window[..., prefix_len:]
+    proposal_new = proposal_full[..., prefix_len:]
+    handoff_step = int(round(max(0.0, min(1.0, source_fraction)) * transition_steps))
+    local_handoff = max(0, min(code_step_count(source_new), handoff_step - transition_offset))
+    fused_new = proposal_new.clone()
+    fused_new[..., :local_handoff] = source_new[..., :local_handoff]
 
     if prefix_len > 0:
         anchored[..., prefix_len:] = fused_new
