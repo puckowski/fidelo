@@ -5,7 +5,8 @@ Music generation project.
 ## Training
 
 python .\train_latent_audio_tokenizer.py --epochs 20  
-python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --epochs 20      
+python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --epochs 20   
+python .\train_latent_audio_prior.py --tokenizer-dir latent_audio_tokenizer_out --finetune-from latent_audio_prior_out --out-dir latent_audio_prior_finetuned --lr 5e-5 --weight-decay 1e-4 --grad-accum-steps 4 --epochs 5   
 python .\train_latent_audio_tokenizer.py --clip-seconds 3.33   
 python .\train_latent_audio_tokenizer.py --finetune-from latent_audio_tokenizer_out --epochs 5
 python .\train_latent_audio_tokenizer.py --finetune-from  latent_audio_tokenizer_out  --lr 5e-5 --weight-decay 5e-6 --grad-accum-steps 4 --commitment-cost 0.2 --clip-seconds 5 --num-quantizers 2 --epochs 5
@@ -18,14 +19,38 @@ python .\prepare_beginning_transition_manifest.py `
   --intro-seconds 10 `
   --body-seconds 9
 
-python.exe `
-  .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_intro_body_continued.py `
-  --tokenizer-dir .\3.33smodel\9smodel `
-  --prior-dir .\3.33smodel\9smodel\prior_transition_finetuned `
-  --prompt "your prompt" `
-  --duration-seconds 45 `
-  --continuation-prefix-seconds 2.0 `
-  --output .\inference_output\continued_song.wav
+python .\train_latent_audio_prior_beginning_transitions.py `
+  --tokenizer-dir latent_audio_tokenizer_out `
+  --finetune-from latent_audio_prior_out `
+  --manifest .\dataset\beginning_transition_manifest.csv `
+  --audio-dir .\dataset\audio `
+  --out-dir .\3.33smodel\9smodel\prior_transition_finetuned `
+  --intro-seconds 10 `
+  --body-seconds 9 `
+  --boundary-before-seconds 2 `
+  --boundary-after-seconds 3 `
+  --boundary-loss-weight 3.0 `
+  --body-loss-weight 1.25 `
+  --context-corruption-prob 0.05 `
+  --tbptt-steps 1024 `
+  --grad-accum-examples 4 `
+  --lr 3e-5 `
+  --weight-decay 1e-4 `
+  --epochs 5
+
+python .\train_latent_audio_tokenizer.py `
+  --finetune-from latent_audio_tokenizer_out `
+  --out-dir .\3.33smodel\latent_audio_tokenizer_out_modelv6_recon_ft `
+  --lr 2e-5 `
+  --weight-decay 1e-6 `
+  --batch-size 4 `
+  --grad-accum-steps 4 `
+  --recon-weight 1.0 `
+  --stft-weight 0.50 `
+  --vq-weight 0.50 `
+  --random-crop `
+  --val-ratio 0.05 `
+  --epochs 5
 
 The continued generator carries the exact GRU hidden state across internal windows and accepted output clips. After source retrieval and token fusion, it advances the state with the actual accepted tokens, so recurrent context matches the audio codes that are retained. Every retry branches from the last accepted state; a rejected retry does not alter later generation. `--continuation-prefix-seconds` remains useful for source-window continuity, while the GRU itself uses persistent state by default. Add `--disable-persistent-gru-state` to restore prefix-replay behavior for comparison.
 
@@ -38,8 +63,12 @@ python.exe `
   --prior-dir .\3.33smodel\9smodel\prior_transition_finetuned `
   --prompt "metal" `
   --duration-seconds 45 `
+  --intro-theme-top-n 3 `
+  --intro-theme-temperature 0.75 `
   --latent-transition-seconds 4.0 `
   --latent-motif-match-seconds 0.75 `
+  --latent-motif-choice-top 3 `
+  --latent-motif-choice-temperature 0.35 `
   --latent-transition-min-ac-rms 0.008 `
   --latent-overlap-neighborhood-seconds 0.08 `
   --latent-overlap-neighborhood-candidates 9 `
@@ -52,7 +81,7 @@ python.exe `
   --output .\inference_output\latent_guided_song.wav
 ```
 
-This variant retrieves regular-source motifs by similarity to the accepted intro tail and rejects quiet motif windows before constructing the transition. It creates a smoothly evolving latent target across the aligned intro and regular overlap. A global path optimizer selects intact residual-VQ pairs from nearby observed positions, scoring target distance, adjacent latent jumps, distance from aligned source timing, and skips or repeats within each source. The path starts in the intro, switches to the regular motif exactly once, and cannot return to the intro. It never averages token IDs, combines quantizer streams from different candidates, or inserts arbitrary prior tokens inside the overlap.
+This variant retrieves regular-source motifs by similarity to the accepted intro tail and rejects quiet motif windows before constructing the transition. It samples from the highest-ranked energy-valid motifs, seeded by `--seed`, so a different seed can produce a different but still closely matched regular source. `--latent-motif-choice-top` bounds that pool and `--latent-motif-choice-temperature` controls its bias toward the best match; set the pool to `1` for exact best-match behavior. Intro themes use the same seeded selection through `--intro-theme-top-n` and `--intro-theme-temperature`. It creates a smoothly evolving latent target across the aligned intro and regular overlap. A global path optimizer selects intact residual-VQ pairs from nearby observed positions, scoring target distance, adjacent latent jumps, distance from aligned source timing, and skips or repeats within each source. The path starts in the intro, switches to the regular motif exactly once, and cannot return to the intro. It never averages token IDs, combines quantizer streams from different candidates, or inserts arbitrary prior tokens inside the overlap.
 
 `--latent-overlap-neighborhood-seconds` bounds how far selection may move from each aligned source position, and `--latent-overlap-neighborhood-candidates` controls how many positions per source are evaluated. Increase `--latent-overlap-continuity-weight` to favor a cleaner splice boundary, `--latent-overlap-offset-weight` to stay near aligned timing, and `--latent-overlap-progression-weight` to discourage skipped or repeated source tokens. Set the neighborhood to `0` for a strict splice between two contiguous observed runs. These options are separate from the source-window retrieval option `--continuity-weight`. Selection is deterministic for fixed inputs.
 
@@ -203,9 +232,9 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
   --song-intro-fade-ms 220 `
   --song-outro-fade-ms 2200
   
-  python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_intro_body_latent_guided_tokens.py `
-  --prompt "synthwave" `
-  --seed 178 `
+python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_intro_body_latent_guided_tokens.py `
+  --prompt "rock" `
+  --seed 9081123 `
   --duration-seconds 45 `
   --repetition-penalty 1.03 `
   --repetition-window 256 `
@@ -227,7 +256,6 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
   --theme-repeat-window 8 `
   --theme-repeat-bonus 7.0 `
   --theme-repeat-decay 0.85 `
-  --theme-crossfade-ms 600 `
   --intro-ratio 0.20 `
   --intro-theme-top-n 1 `
   --intro-theme-temperature 0.15 `
@@ -241,7 +269,6 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
   --intro-body-overlap-seconds 1.5 `
   --intro-body-source-strength 1.0 `
   --fade-ms 1200 `
-  --latent-transition-seconds 4.0 `
   --latent-motif-match-seconds 0.75 `
   --latent-guidance-strength 4.0 `
   --latent-guidance-candidate-top-k 4 `
@@ -255,23 +282,22 @@ python .\generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_
   --top-p 0.85 `
   --intro-theme-seconds 4.0 `
   --theme-seconds 4.0 `
-  --window-energy-check-top 12 `
   --min-window-rms 0.0035 `
   --min-window-peak 0.015 `
   --clip-energy-check-seconds 2.0 `
   --min-clip-rms 0.006 `
   --min-clip-peak 0.028 `
-    --window-energy-check-top 64 `
+  --window-energy-check-top 64 `
   --latent-overlap-neighborhood-seconds 0 `
   --latent-overlap-neighborhood-candidates 1 `
   --latent-overlap-continuity-weight 2.0 `
   --latent-overlap-progression-weight 5.0 `
-  --latent-transition-min-ac-rms 0.008 `   
+  --latent-transition-min-ac-rms 0.008 `
   --latent-transition-seconds 6.0 `
   --section-crossfade-ms 3500 `
   --theme-crossfade-ms 900 `
   --clip-crossfade-ms 1500
-  
+
 ## Model V2
 
 After right-sizing the context length, model V2 quality improved.
