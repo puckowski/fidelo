@@ -1,0 +1,1 @@
+"""Fidelo web service package."""

@@ -1,0 +1,54 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      FIDELO_MODE: production
+      FIDELO_REDIS_URL: redis://redis:6379/0
+      FIDELO_S3_BUCKET: ${FIDELO_S3_BUCKET}
+      FIDELO_S3_PREFIX: ${FIDELO_S3_PREFIX:-generations}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker-gpu-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      FIDELO_MODE: production
+      FIDELO_REDIS_URL: redis://redis:6379/0
+      FIDELO_S3_BUCKET: ${FIDELO_S3_BUCKET}
+      FIDELO_S3_PREFIX: ${FIDELO_S3_PREFIX:-generations}
+      FIDELO_KEEP_LOCAL_OUTPUTS: "false"
+      FIDELO_TOKENIZER_DIR: /app/3.33smodel/9smodel
+      FIDELO_PRIOR_DIR: /app/3.33smodel/9smodel/prior_transition_finetuned
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      NVIDIA_VISIBLE_DEVICES: "0"
+    depends_on:
+      - redis
+    volumes:
+      - ./3.33smodel:/app/3.33smodel:ro
+      - ./dataset:/app/dataset:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  redis-data:

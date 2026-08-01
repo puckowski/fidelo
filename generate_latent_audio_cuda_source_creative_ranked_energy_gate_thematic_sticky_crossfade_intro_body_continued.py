@@ -50,13 +50,13 @@ def parse_args(configure_parser=None):
         parser.add_argument(
             "--intro-body-average-seconds",
             type=float,
-            default=0.2,
+            default=0.4,
             help="Duration that smoothly moves from the intro tail to a 50/50 intro/regular VQ blend.",
         )
         parser.add_argument(
             "--intro-body-overlap-seconds",
             type=float,
-            default=0.5,
+            default=1.5,
             help="After the fixed average, gradually release from 50/50 into 100% regular VQ embeddings over this duration.",
         )
         parser.add_argument(

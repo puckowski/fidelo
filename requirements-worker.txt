@@ -1,0 +1,2 @@
+-r requirements-service.txt
+soundfile==0.13.1

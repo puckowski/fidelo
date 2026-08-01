@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f1f0eb">
+  <meta name="description" content="Fidelo prompt-conditioned music generation studio.">
+  <title>Fidelo Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Fidelo studio home">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <span>FIDELO</span>
+    </a>
+    <div class="system-state">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="system-label">Connecting</span>
+      <span class="mode-tag" id="mode-tag">LOCAL</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="composer" aria-labelledby="composer-title">
+      <div class="section-kicker">01 / COMPOSE</div>
+      <h1 id="composer-title">Make a new track</h1>
+
+      <form id="generation-form">
+        <label class="field-label" for="prompt">Sound direction</label>
+        <div class="prompt-wrap">
+          <textarea id="prompt" name="prompt" rows="4" maxlength="240" required placeholder="Heavy metal, tight double kick, melodic lead guitar"></textarea>
+          <span class="char-count"><span id="char-count">0</span>/240</span>
+        </div>
+
+        <div class="quick-prompts" aria-label="Prompt suggestions">
+          <button type="button" class="prompt-chip">industrial metal</button>
+          <button type="button" class="prompt-chip">dream pop</button>
+          <button type="button" class="prompt-chip">jazz fusion</button>
+        </div>
+
+        <div class="control-grid">
+          <label class="control" for="duration">
+            <span><span>Length</span><output id="duration-value">30s</output></span>
+            <input type="range" id="duration" name="duration" min="5" max="180" value="30" step="5">
+          </label>
+          <label class="control" for="source-strength">
+            <span><span>Source fidelity</span><output id="source-strength-value">90%</output></span>
+            <input type="range" id="source-strength" name="source-strength" min="0" max="1" value="0.9" step="0.01">
+          </label>
+          <label class="control" for="temperature">
+            <span><span>Variation</span><output id="temperature-value">0.60</output></span>
+            <input type="range" id="temperature" name="temperature" min="0.05" max="2" value="0.6" step="0.05">
+          </label>
+          <label class="control" for="creativity">
+            <span><span>Token creativity</span><output id="creativity-value">4%</output></span>
+            <input type="range" id="creativity" name="creativity" min="0" max="0.5" value="0.04" step="0.01">
+          </label>
+        </div>
+
+        <details class="advanced">
+          <summary>Advanced controls <i data-lucide="chevron-down"></i></summary>
+          <div class="advanced-grid">
+            <label>Seed<input id="seed" type="number" min="0" max="2147483647" placeholder="Random"></label>
+            <label>Top K<input id="top-k" type="number" min="1" max="64" value="4"></label>
+            <label>Top P<input id="top-p" type="number" min="0.05" max="1" step="0.05" value="0.85"></label>
+            <label>Theme (sec)<input id="theme-seconds" type="number" min="1" max="20" step="0.5" value="4"></label>
+            <label>Transition (sec)<input id="transition-seconds" type="number" min="0" max="20" step="0.5" value="5"></label>
+          </div>
+        </details>
+
+        <button class="generate-button" id="generate-button" type="submit">
+          <i data-lucide="sparkles"></i>
+          <span>Generate track</span>
+          <span class="button-duration" id="button-duration">30 SEC</span>
+        </button>
+        <p class="form-error" id="form-error" role="alert"></p>
+      </form>
+    </section>
+
+    <section class="monitor" aria-labelledby="monitor-title">
+      <div class="monitor-head">
+        <div>
+          <div class="section-kicker">02 / MONITOR</div>
+          <h2 id="monitor-title">Now rendering</h2>
+        </div>
+        <span class="render-state idle" id="render-state">IDLE</span>
+      </div>
+
+      <div class="artwork" id="artwork">
+        <canvas id="waveform" aria-label="Audio waveform"></canvas>
+        <div class="track-index" id="track-index">F / 001</div>
+        <div class="render-overlay" id="render-overlay">
+          <span class="pulse-ring"></span>
+          <strong id="render-message">Ready for a new idea</strong>
+          <small id="render-detail">GPU worker standing by</small>
+        </div>
+      </div>
+
+      <div class="active-track">
+        <div class="track-copy">
+          <span class="track-label">CURRENT OUTPUT</span>
+          <h3 id="active-prompt">No track selected</h3>
+          <p id="active-meta">Create a generation to begin</p>
+        </div>
+        <a class="icon-button hidden" id="download-button" href="#" download title="Download WAV" aria-label="Download WAV">
+          <i data-lucide="download"></i>
+        </a>
+      </div>
+      <audio id="audio-player" controls preload="metadata"></audio>
+      <div class="error-panel hidden" id="job-error" role="alert"></div>
+    </section>
+
+    <aside class="library" aria-labelledby="library-title">
+      <div class="library-head">
+        <div>
+          <div class="section-kicker">03 / OUTPUTS</div>
+          <h2 id="library-title">Recent tracks</h2>
+        </div>
+        <button class="icon-button" id="refresh-button" type="button" title="Refresh jobs" aria-label="Refresh jobs">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </div>
+      <div class="job-list" id="job-list">
+        <div class="empty-state">No generations yet</div>
+      </div>
+    </aside>
+  </main>
+
+  <template id="job-template">
+    <button class="job-row" type="button">
+      <span class="job-number"></span>
+      <span class="job-main"><strong></strong><small></small></span>
+      <span class="job-status"></span>
+    </button>
+  </template>
+
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>

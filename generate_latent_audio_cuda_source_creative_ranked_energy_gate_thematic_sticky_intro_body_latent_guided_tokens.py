@@ -1,3 +1,5 @@
+import math
+import random
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -15,7 +17,7 @@ def configure_parser(parser):
     parser.add_argument(
         "--latent-transition-seconds",
         type=float,
-        default=4.0,
+        default=5.0,
         help="Duration of first-body token generation guided by the evolving latent target.",
     )
     parser.add_argument(
@@ -41,6 +43,18 @@ def configure_parser(parser):
         type=float,
         default=0.10,
         help="Weight of prompt-match score when selecting the body motif.",
+    )
+    parser.add_argument(
+        "--latent-motif-choice-top",
+        type=int,
+        default=3,
+        help="Sample among this many highest-ranked energy-valid body motifs. Set to 1 for the exact best match.",
+    )
+    parser.add_argument(
+        "--latent-motif-choice-temperature",
+        type=float,
+        default=0.75,
+        help="Motif selection randomness among the top matches; lower values favor the best match.",
     )
     parser.add_argument(
         "--latent-guidance-strength",
@@ -93,19 +107,19 @@ def configure_parser(parser):
     parser.add_argument(
         "--latent-overlap-neighborhood-seconds",
         type=float,
-        default=0.08,
+        default=0.0,
         help="Nearby intro and motif range searched for complete observed residual-VQ pairs.",
     )
     parser.add_argument(
         "--latent-overlap-neighborhood-candidates",
         type=int,
-        default=9,
+        default=1,
         help="Evenly spaced candidate positions drawn from each source neighborhood.",
     )
     parser.add_argument(
         "--latent-overlap-continuity-weight",
         type=float,
-        default=0.35,
+        default=2.0,
         help="Penalty for latent jumps from the previously selected complete pair.",
     )
     parser.add_argument(
@@ -117,26 +131,28 @@ def configure_parser(parser):
     parser.add_argument(
         "--latent-overlap-progression-weight",
         type=float,
-        default=0.5,
+        default=5.0,
         help="Penalty for repeats or skips instead of advancing one observed source step.",
     )
     parser.add_argument(
         "--clip-crossfade-ms",
         type=int,
-        default=900,
+        default=1500,
         help="Equal-power waveform crossfade at every accepted clip/sequence boundary.",
     )
     parser.add_argument(
         "--section-crossfade-ms",
         type=int,
-        default=1800,
+        default=3500,
         help="Equal-power intro-to-regular fade centered on the selected regular-motif token handoff.",
     )
     parser.set_defaults(
         disable_intro_source_continuation=True,
         intro_body_prior_seconds=0.0,
-        intro_body_average_seconds=0.0,
-        intro_body_overlap_seconds=0.0,
+        intro_body_average_seconds=0.4,
+        intro_body_overlap_seconds=1.5,
+        intro_theme_top_n=3,
+        intro_theme_temperature=0.75,
     )
 
 
@@ -159,6 +175,28 @@ def _batched_codes(codes: torch.Tensor, tokenizer_model) -> torch.Tensor:
     raise ValueError(
         f"Cannot normalize code shape {tuple(codes.shape)} for {num_quantizers} quantizer streams"
     )
+
+
+def choose_ranked_motif(valid_motifs, args):
+    choice_count = min(
+        len(valid_motifs),
+        max(1, int(getattr(args, "latent_motif_choice_top", 1))),
+    )
+    choices = valid_motifs[:choice_count]
+    if len(choices) == 1:
+        return choices[0]
+
+    temperature = max(1e-6, float(getattr(args, "latent_motif_choice_temperature", 0.0)))
+    scores = [item[0] for item in choices]
+    best_score = max(scores)
+    weights = [math.exp((score - best_score) / temperature) for score in scores]
+    pick = random.Random(int(getattr(args, "seed", 0)) + 641197).random() * sum(weights)
+    running = 0.0
+    for motif, weight in zip(choices, weights):
+        running += weight
+        if pick <= running:
+            return motif
+    return choices[-1]
 
 
 @torch.no_grad()
@@ -211,7 +249,8 @@ def retrieve_body_motif(
 
     ranked_results.sort(key=lambda item: item[0], reverse=True)
     quality_check_count = max(1, int(getattr(args, "window_energy_check_top", 12)))
-    for _, entry, start, similarity in ranked_results[:quality_check_count]:
+    valid_motifs = []
+    for score, entry, start, similarity in ranked_results[:quality_check_count]:
         motif_codes = entry["codes"][..., start:start + requested_steps].clone()
         motif_audio = tokenizer_model.decode_codes(
             _batched_codes(motif_codes, tokenizer_model).to(device)
@@ -227,7 +266,8 @@ def retrieve_body_motif(
             args,
         )
         if quiet_window is None and has_energy:
-            return entry, start, motif_codes, similarity
+            valid_motifs.append((score, entry, start, motif_codes, similarity))
+            continue
         quiet_ac_rms = None if quiet_window is None else quiet_window.get("ac_rms")
         print(
             "Rejected quiet latent-transition motif "
@@ -235,7 +275,11 @@ def retrieve_body_motif(
             f"quiet_ac_rms={quiet_ac_rms if quiet_ac_rms is not None else 'n/a'}"
         )
 
-    return None
+    if not valid_motifs:
+        return None
+
+    _, entry, start, motif_codes, similarity = choose_ranked_motif(valid_motifs, args)
+    return entry, start, motif_codes, similarity
 
 
 @torch.no_grad()
