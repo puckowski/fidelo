@@ -34,6 +34,7 @@ htmlcov/
 # Large/generated data
 prepared/
 model_out/
+generated/
 generated*.wav
 latent_generated_*.wav
 latent_blend_*.wav

@@ -3,6 +3,7 @@ from dataclasses import replace
 import math
 import os
 import random
+import sys
 import time
 from typing import Dict, List, Optional
 
@@ -11,6 +12,14 @@ import torch
 import generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_intro_body as intro_body
 import generate_latent_audio_cuda_source_creative_ranked_energy_gate_thematic_sticky_crossfade_structured as structured
 from latent_audio_token_pipeline import match_audio_length
+
+
+def format_console_text(value: object) -> str:
+    text = str(value)
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return text
+    return text.encode(encoding, errors="backslashreplace").decode(encoding)
 
 
 def parse_args(configure_parser=None):
@@ -295,7 +304,10 @@ def main(configure_parser=None, decode_song=None, prepare_clip_args=None):
     )
     for entry in candidate_entries:
         source_type = "beginning" if entry.get("song_beginning", False) else "regular"
-        print(f"- {entry['file']} | source_type={source_type} | score={entry['match_score']:.2f} | {entry['text']}")
+        print(
+            f"- {entry['file']} | source_type={source_type} | score={entry['match_score']:.2f} | "
+            f"{format_console_text(entry['text'])}"
+        )
 
     section_names = intro_body.build_song_sections(clip_count, args.intro_ratio)
     accepted_code_clips: List[torch.Tensor] = []

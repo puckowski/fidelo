@@ -2,6 +2,17 @@
 
 Music generation project.
 
+## Web studio
+
+Fidelo includes a FastAPI web studio with a zero-infrastructure local mode and production adapters for Redis/RQ and S3-compatible storage.
+
+```powershell
+C:\Users\fooba\anaconda3\python.exe -m pip install -r requirements-service.txt
+C:\Users\fooba\anaconda3\python.exe -m uvicorn fidelo_service.app:app --host 127.0.0.1 --port 8000
+```
+
+Open <http://127.0.0.1:8000>. See [SERVICE.md](SERVICE.md) for API routes, environment settings, GPU worker deployment, and Docker Compose setup.
+
 ## Training
 
 python .\train_latent_audio_tokenizer.py --epochs 20  
