@@ -8,7 +8,7 @@ Fidelo includes a FastAPI web studio with a zero-infrastructure local mode and p
 
 ```powershell
 C:\Users\fooba\anaconda3\python.exe -m pip install -r requirements-service.txt
-C:\Users\fooba\anaconda3\python.exe -m uvicorn fidelo_service.app:app --host 127.0.0.1 --port 8000
+C:\Users\fooba\anaconda3\python.exe -m uvicorn fidelo_service.app:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 10
 ```
 
 Open <http://127.0.0.1:8000>. See [SERVICE.md](SERVICE.md) for API routes, environment settings, GPU worker deployment, and Docker Compose setup.

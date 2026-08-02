@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event
 from typing import Any
 
 from .config import Settings
+from .events import publish_redis_job_event
 from .storage import get_object_store
 
 
@@ -45,7 +47,12 @@ def build_generator_command(payload: dict[str, Any], settings: Settings, output_
     ]
 
 
-def run_generation(job_id: str, payload: dict[str, Any], settings_data: dict[str, Any]) -> dict[str, Any]:
+def run_generation(
+    job_id: str,
+    payload: dict[str, Any],
+    settings_data: dict[str, Any],
+    cancel_event: Event | None = None,
+) -> dict[str, Any]:
     settings = Settings(**settings_data)
     output_dir = Path(settings.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -56,27 +63,69 @@ def run_generation(job_id: str, payload: dict[str, Any], settings_data: dict[str
     environment.setdefault("PYTHONUNBUFFERED", "1")
 
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(Path(settings.generator_script).resolve().parent),
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=settings.job_timeout_seconds,
-            check=False,
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path(settings.generator_script).resolve().parent),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            remaining_seconds = settings.job_timeout_seconds
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                    raise RuntimeError("Generation cancelled during server shutdown")
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.25, remaining_seconds))
+                    break
+                except subprocess.TimeoutExpired:
+                    remaining_seconds -= 0.25
+                    if remaining_seconds <= 0:
+                        process.kill()
+                        process.communicate()
+                        raise RuntimeError(f"Generation exceeded {settings.job_timeout_seconds} seconds")
+        except OSError as exc:
+            raise RuntimeError(f"Could not start generator: {exc}") from exc
+
+        logs = "\n".join(part.strip() for part in (stdout, stderr) if part.strip())
+        if process.returncode != 0:
+            tail = logs[-4000:] if logs else "No model output was captured"
+            raise RuntimeError(f"Generator exited with code {process.returncode}:\n{tail}")
+        if not output_path.is_file():
+            raise RuntimeError("Generator completed without creating an output file")
+
+        object_key = f"{settings.s3_prefix}/{filename}" if not settings.is_local else filename
+        published = get_object_store(settings).publish(output_path, object_key)
+        if not settings.is_local and not settings.keep_local_outputs:
+            output_path.unlink(missing_ok=True)
+        result = {**published, "logs": logs[-12000:]}
+    except Exception as exc:
+        if not settings.is_local:
+            publish_redis_job_event(
+                settings.redis_url,
+                settings.queue_name,
+                {"id": job_id, "status": "failed", "error": str(exc)[-4000:]},
+            )
+        raise
+
+    if not settings.is_local:
+        url = f"/api/files/{result['object_key']}"
+        publish_redis_job_event(
+            settings.redis_url,
+            settings.queue_name,
+            {
+                "id": job_id,
+                "status": "completed",
+                "audio_url": url,
+                "download_url": f"{url}?download=1",
+                "logs": result["logs"],
+            },
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Generation exceeded {settings.job_timeout_seconds} seconds") from exc
-
-    logs = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part.strip())
-    if completed.returncode != 0:
-        tail = logs[-4000:] if logs else "No model output was captured"
-        raise RuntimeError(f"Generator exited with code {completed.returncode}:\n{tail}")
-    if not output_path.is_file():
-        raise RuntimeError("Generator completed without creating an output file")
-
-    object_key = f"{settings.s3_prefix}/{filename}" if not settings.is_local else filename
-    published = get_object_store(settings).publish(output_path, object_key)
-    if not settings.is_local and not settings.keep_local_outputs:
-        output_path.unlink(missing_ok=True)
-    return {**published, "logs": logs[-12000:]}
+    return result

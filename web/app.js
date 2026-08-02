@@ -1,4 +1,4 @@
-const state = { jobs: [], activeJobId: null, pollTimer: null, waveformToken: 0 };
+const state = { jobs: [], activeJobId: null, jobSockets: new Map(), waveformToken: 0 };
 const byId = (id) => document.getElementById(id);
 const form = byId("generation-form");
 const promptInput = byId("prompt");
@@ -72,7 +72,7 @@ form.addEventListener("submit", async (event) => {
     state.jobs.unshift(job);
     renderJobs();
     showJob(job);
-    startPolling();
+    watchJob(job.id);
   } catch (error) {
     byId("form-error").textContent = error.message;
   } finally {
@@ -102,7 +102,9 @@ async function loadJobs() {
       state.activeJobId = state.jobs[0].id;
       showJob(state.jobs[0]);
     }
-    if (state.jobs.some((job) => ["queued", "running"].includes(job.status))) startPolling();
+    state.jobs
+      .filter((job) => ["queued", "running"].includes(job.status))
+      .forEach((job) => watchJob(job.id));
   } catch (error) {
     byId("job-list").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
   }
@@ -167,25 +169,23 @@ function showJob(job) {
   }
 }
 
-async function pollJobs() {
-  const pending = state.jobs.filter((job) => ["queued", "running"].includes(job.status));
-  if (!pending.length) return stopPolling();
-  const updates = await Promise.allSettled(pending.map((job) => api(`/api/jobs/${job.id}`)));
-  updates.forEach((result) => {
-    if (result.status !== "fulfilled") return;
-    const index = state.jobs.findIndex((job) => job.id === result.value.id);
-    if (index >= 0) state.jobs[index] = result.value;
-    if (result.value.id === state.activeJobId) showJob(result.value);
-  });
-  renderJobs();
-}
+function watchJob(jobId) {
+  if (state.jobSockets.has(jobId)) return;
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${window.location.host}/api/jobs/${encodeURIComponent(jobId)}/events`);
+  state.jobSockets.set(jobId, socket);
 
-function startPolling() {
-  if (state.pollTimer) return;
-  state.pollTimer = window.setInterval(pollJobs, 2200);
-  pollJobs();
+  socket.addEventListener("message", (event) => {
+    const update = JSON.parse(event.data);
+    const index = state.jobs.findIndex((job) => job.id === update.id);
+    if (index < 0) return;
+    state.jobs[index] = { ...state.jobs[index], ...update };
+    renderJobs();
+    if (update.id === state.activeJobId) showJob(state.jobs[index]);
+  });
+  socket.addEventListener("close", () => state.jobSockets.delete(jobId));
+  socket.addEventListener("error", () => socket.close());
 }
-function stopPolling() { window.clearInterval(state.pollTimer); state.pollTimer = null; }
 
 function fitCanvas() {
   const ratio = window.devicePixelRatio || 1;

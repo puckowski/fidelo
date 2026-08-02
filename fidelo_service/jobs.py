@@ -3,8 +3,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import Lock
-from typing import Any
+from threading import Event, Lock
+from typing import Any, Callable
 from uuid import uuid4
 
 from .config import Settings
@@ -25,16 +25,22 @@ class JobBackend(ABC):
     def list(self, limit: int = 30) -> list[GenerationJob]:
         raise NotImplementedError
 
+    @abstractmethod
+    def shutdown(self) -> None:
+        raise NotImplementedError
+
 
 @dataclass
 class _LocalRecord:
     job: GenerationJob
     future: Future[dict[str, Any]] | None = None
+    cancel_event: Event | None = None
 
 
 class LocalJobBackend(JobBackend):
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, on_update: Callable[[str], None] | None = None):
         self.settings = settings
+        self.on_update = on_update
         self.executor = ThreadPoolExecutor(
             max_workers=settings.local_workers,
             thread_name_prefix="fidelo-gpu",
@@ -54,15 +60,17 @@ class LocalJobBackend(JobBackend):
         )
         with self.lock:
             self.records[job_id] = _LocalRecord(job=job)
-        future = self.executor.submit(self._execute, job_id, payload)
+            cancel_event = Event()
+            self.records[job_id].cancel_event = cancel_event
+        future = self.executor.submit(self._execute, job_id, payload, cancel_event)
         with self.lock:
             self.records[job_id].future = future
         return job.model_copy(deep=True)
 
-    def _execute(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _execute(self, job_id: str, payload: dict[str, Any], cancel_event: Event) -> dict[str, Any]:
         self._update(job_id, status=JobStatus.running, started_at=utc_now())
         try:
-            result = run_generation(job_id, payload, self.settings.as_task_dict())
+            result = run_generation(job_id, payload, self.settings.as_task_dict(), cancel_event)
         except Exception as exc:
             self._update(
                 job_id,
@@ -83,6 +91,8 @@ class LocalJobBackend(JobBackend):
         with self.lock:
             record = self.records[job_id]
             record.job = record.job.model_copy(update=changes)
+        if self.on_update is not None:
+            self.on_update(job_id)
 
     def get(self, job_id: str) -> GenerationJob | None:
         with self.lock:
@@ -101,6 +111,16 @@ class LocalJobBackend(JobBackend):
         with self.lock:
             ids = list(reversed(self.records.keys()))[:limit]
         return [job for job_id in ids if (job := self.get(job_id)) is not None]
+
+    def shutdown(self) -> None:
+        with self.lock:
+            records = tuple(self.records.values())
+        for record in records:
+            if record.cancel_event is not None:
+                record.cancel_event.set()
+            if record.future is not None:
+                record.future.cancel()
+        self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 class RedisJobBackend(JobBackend):
@@ -180,6 +200,9 @@ class RedisJobBackend(JobBackend):
         job_ids = [value.decode() if isinstance(value, bytes) else value for value in self.connection.lrange(self.index_key, 0, limit - 1)]
         jobs = (self.queue.fetch_job(job_id) for job_id in job_ids)
         return [self._serialize(job) for job in jobs if job is not None]
+
+    def shutdown(self) -> None:
+        self.connection.close()
 
 
 def get_job_backend(settings: Settings) -> JobBackend:

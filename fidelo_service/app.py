@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
+import json
 from pathlib import Path
+import sys
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings, validate_settings
-from .jobs import JobBackend, get_job_backend
+from .events import LocalJobEventHub, job_event_channel
+from .jobs import JobBackend, LocalJobBackend, get_job_backend
 from .schemas import GenerationJob, GenerationRequest
+
+
+def _is_expected_windows_disconnect(context: dict[str, object]) -> bool:
+    exception = context.get("exception")
+    error_code = getattr(exception, "winerror", None) or getattr(exception, "errno", None)
+    return (
+        sys.platform == "win32"
+        and isinstance(exception, ConnectionResetError)
+        and error_code == 10054
+        and "_ProactorBasePipeTransport._call_connection_lost" in repr(context.get("handle"))
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -22,7 +37,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         Path(active_settings.output_dir).mkdir(parents=True, exist_ok=True)
         app.state.settings = active_settings
         app.state.jobs = get_job_backend(active_settings)
-        yield
+        app.state.job_events = LocalJobEventHub()
+        loop = asyncio.get_running_loop()
+        previous_exception_handler = loop.get_exception_handler()
+
+        def handle_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, object]) -> None:
+            if _is_expected_windows_disconnect(context):
+                return
+            if previous_exception_handler is not None:
+                previous_exception_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        loop.set_exception_handler(handle_loop_exception)
+        if isinstance(app.state.jobs, LocalJobBackend):
+            app.state.jobs.on_update = app.state.job_events.publish
+        try:
+            yield
+        finally:
+            try:
+                await asyncio.to_thread(app.state.jobs.shutdown)
+            finally:
+                loop.set_exception_handler(previous_exception_handler)
 
     app = FastAPI(
         title="Fidelo Music API",
@@ -66,6 +102,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
+
+    @app.websocket("/api/jobs/{job_id}/events")
+    async def watch_job(job_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        backend: JobBackend = app.state.jobs
+        try:
+            if active_settings.is_local:
+                async with app.state.job_events.subscribe(job_id) as updates:
+                    job = backend.get(job_id)
+                    if job is None:
+                        await websocket.close(code=1008)
+                        return
+                    await websocket.send_json(job.model_dump(mode="json"))
+                    while job.status.value not in {"completed", "failed"}:
+                        await updates.get()
+                        job = backend.get(job_id)
+                        if job is None:
+                            break
+                        await websocket.send_json(job.model_dump(mode="json"))
+            else:
+                pubsub = backend.connection.pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(job_event_channel(active_settings.queue_name))
+                try:
+                    job = backend.get(job_id)
+                    if job is None:
+                        await websocket.close(code=1008)
+                        return
+                    await websocket.send_json(job.model_dump(mode="json"))
+                    while job.status.value not in {"completed", "failed"}:
+                        message = await asyncio.to_thread(pubsub.get_message, timeout=30.0)
+                        if message is None or message["type"] != "message":
+                            continue
+                        event = json.loads(message["data"])
+                        if event.get("id") != job_id:
+                            continue
+                        await websocket.send_json(event)
+                        job = job.model_copy(update=event)
+                finally:
+                    pubsub.close()
+        except WebSocketDisconnect:
+            return
+        finally:
+            if websocket.client_state.name == "CONNECTED":
+                await websocket.close()
 
     @app.get("/api/files/{object_key:path}")
     def get_file(object_key: str, download: bool = False):
