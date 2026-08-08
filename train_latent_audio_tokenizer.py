@@ -28,16 +28,26 @@ def parse_args():
     parser.add_argument("--audio-dir", default="dataset/audio")
     parser.add_argument("--out-dir", default="latent_audio_tokenizer_out")
     parser.add_argument("--sample-rate", type=int, default=44100)
-    parser.add_argument("--clip-seconds", type=float, default=3.33)
+    parser.add_argument(
+        "--clip-seconds",
+        type=float,
+        default=None,
+        help="Training clip length. Defaults to 3.33 for new models and preserves the saved value when fine-tuning.",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument(
         "--lr",
         type=float,
         default=None,
-        help="Learning rate. Defaults to 2e-4 for a new tokenizer and 5e-5 for fine-tuning.",
+        help="Learning rate. Defaults to 2e-4 for a new tokenizer and 2e-5 for fine-tuning.",
     )
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="AdamW weight decay. Defaults to 1e-5 for a new tokenizer and 1e-6 for fine-tuning.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-ratio", type=float, default=0.02)
@@ -61,11 +71,18 @@ def parse_args():
     parser.add_argument("--prior-hidden-size", type=int, default=768)
     parser.add_argument("--prior-num-layers", type=int, default=3)
     parser.add_argument("--prior-dropout", type=float, default=0.15)
-    parser.add_argument("--recon-weight", type=float, default=1.0)
-    parser.add_argument("--vq-weight", type=float, default=1.0)
-    parser.add_argument("--stft-weight", type=float, default=0.35)
+    parser.add_argument("--recon-weight", type=float, default=None, help="MAE reconstruction loss weight.")
+    parser.add_argument("--mse-weight", type=float, default=None, help="Waveform MSE reconstruction loss weight.")
+    parser.add_argument("--vq-weight", type=float, default=None)
+    parser.add_argument("--stft-weight", type=float, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=2)
     parser.add_argument("--finetune-from", default="", help="Directory containing a saved tokenizer bundle, or a specific tokenizer checkpoint file, to continue training from.")
+    parser.add_argument(
+        "--decoder-finetune-warmup-epochs",
+        type=int,
+        default=1,
+        help="Fine-tune epochs that train only post-quantizer and decoder parameters.",
+    )
     parser.add_argument(
         "--residual-finetune-warmup-epochs",
         type=int,
@@ -183,10 +200,20 @@ def configure_residual_finetune_warmup(model: VQAudioAutoencoder, source_num_qua
     set_module_requires_grad(model.decoder, True)
 
 
+def configure_decoder_finetune_warmup(model: VQAudioAutoencoder, enabled: bool):
+    set_module_requires_grad(model.encoder, not enabled)
+    set_module_requires_grad(model.pre_quant, not enabled)
+    for quantizer in model.quantizers:
+        set_module_requires_grad(quantizer, not enabled)
+    set_module_requires_grad(model.post_quant, True)
+    set_module_requires_grad(model.decoder, True)
+
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
     recon_losses: List[float] = []
+    mse_losses: List[float] = []
     vq_losses: List[float] = []
     stft_losses: List[float] = []
     for batch in loader:
@@ -195,13 +222,16 @@ def evaluate(model, loader, device):
         waveform = batch["waveform"].to(device, non_blocking=True)
         recon, vq_loss, _ = model(waveform)
         recon_loss = torch.mean(torch.abs(recon - waveform))
+        mse_loss = torch.mean((recon - waveform) ** 2)
         stft_loss = multi_resolution_stft_loss(recon, waveform)
         recon_losses.append(float(recon_loss.item()))
+        mse_losses.append(float(mse_loss.item()))
         vq_losses.append(float(vq_loss.item()))
         stft_losses.append(float(stft_loss.item()))
     model.train()
     return (
         sum(recon_losses) / max(1, len(recon_losses)),
+        sum(mse_losses) / max(1, len(mse_losses)),
         sum(vq_losses) / max(1, len(vq_losses)),
         sum(stft_losses) / max(1, len(stft_losses)),
     )
@@ -221,6 +251,8 @@ def main():
             device,
             num_quantizers_override=args.num_quantizers,
         )
+        if args.clip_seconds is not None:
+            config.clip_seconds = args.clip_seconds
         print(f"Fine-tuning tokenizer from {resolved_finetune_path}")
         print(
             "Using saved tokenizer config: "
@@ -233,7 +265,7 @@ def main():
     else:
         config = LatentAudioConfig(
             sample_rate=args.sample_rate,
-            clip_seconds=args.clip_seconds,
+            clip_seconds=3.33 if args.clip_seconds is None else args.clip_seconds,
             codebook_size=args.codebook_size,
             code_dim=args.code_dim,
             num_quantizers=max(1, args.num_quantizers),
@@ -291,24 +323,49 @@ def main():
 
     learning_rate = args.lr
     if learning_rate is None:
-        learning_rate = 5e-5 if args.finetune_from else 2e-4
-    print(f"Tokenizer learning rate: {learning_rate:g}")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
+        learning_rate = 2e-5 if args.finetune_from else 2e-4
+    weight_decay = args.weight_decay
+    if weight_decay is None:
+        weight_decay = 1e-6 if args.finetune_from else 1e-5
+    recon_weight = (
+        args.recon_weight if args.recon_weight is not None else (0.5 if args.finetune_from else 1.0)
+    )
+    mse_weight = args.mse_weight if args.mse_weight is not None else (2.0 if args.finetune_from else 0.0)
+    vq_weight = args.vq_weight if args.vq_weight is not None else (0.25 if args.finetune_from else 1.0)
+    stft_weight = (
+        args.stft_weight if args.stft_weight is not None else (0.25 if args.finetune_from else 0.35)
+    )
+    print(f"Tokenizer learning rate: {learning_rate:g}; weight decay: {weight_decay:g}")
+    print(
+        f"Loss weights: mae={recon_weight:g}, mse={mse_weight:g}, "
+        f"stft={stft_weight:g}, vq={vq_weight:g}"
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    best_score = math.inf
+    best_val_mse = math.inf
     os.makedirs(args.out_dir, exist_ok=True)
 
     for epoch in range(args.epochs):
         model.train()
+        use_decoder_warmup = (
+            bool(args.finetune_from)
+            and args.decoder_finetune_warmup_epochs > 0
+            and epoch < args.decoder_finetune_warmup_epochs
+        )
         use_residual_warmup = (
-            args.finetune_from
+            not use_decoder_warmup
+            and args.finetune_from
             and args.residual_finetune_warmup_epochs > 0
             and config.num_quantizers > source_num_quantizers
             and epoch < args.residual_finetune_warmup_epochs
         )
-        configure_residual_finetune_warmup(model, source_num_quantizers, enabled=bool(use_residual_warmup))
+        if use_decoder_warmup:
+            configure_decoder_finetune_warmup(model, enabled=True)
+        else:
+            configure_residual_finetune_warmup(model, source_num_quantizers, enabled=bool(use_residual_warmup))
         running_recon = 0.0
+        running_mse = 0.0
         running_vq = 0.0
         running_stft = 0.0
         steps = 0
@@ -321,11 +378,13 @@ def main():
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 recon, vq_loss, _ = model(waveform)
                 recon_loss = torch.mean(torch.abs(recon - waveform))
+                mse_loss = torch.mean((recon - waveform) ** 2)
                 stft_loss = multi_resolution_stft_loss(recon, waveform)
                 loss = (
-                    (args.recon_weight * recon_loss)
-                    + (args.vq_weight * vq_loss)
-                    + (args.stft_weight * stft_loss)
+                    (recon_weight * recon_loss)
+                    + (mse_weight * mse_loss)
+                    + (vq_weight * vq_loss)
+                    + (stft_weight * stft_loss)
                 )
                 loss = loss / max(1, args.grad_accum_steps)
 
@@ -339,11 +398,13 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
             running_recon += float(recon_loss.item())
+            running_mse += float(mse_loss.item())
             running_vq += float(vq_loss.item())
             running_stft += float(stft_loss.item())
             steps += 1
             pbar.set_postfix(
-                recon=f"{running_recon / max(1, steps):.4f}",
+                mae=f"{running_recon / max(1, steps):.4f}",
+                mse=f"{running_mse / max(1, steps):.4f}",
                 stft=f"{running_stft / max(1, steps):.4f}",
                 vq=f"{running_vq / max(1, steps):.4f}",
             )
@@ -355,22 +416,26 @@ def main():
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        val_recon, val_vq, val_stft = evaluate(model, val_loader, device)
+        val_recon, val_mse, val_vq, val_stft = evaluate(model, val_loader, device)
         print(
-            f"epoch {epoch + 1}: train_recon={running_recon / max(1, steps):.4f} "
+            f"epoch {epoch + 1}: train_mae={running_recon / max(1, steps):.4f} "
+            f"train_mse={running_mse / max(1, steps):.4f} "
             f"train_stft={running_stft / max(1, steps):.4f} train_vq={running_vq / max(1, steps):.4f} "
-            f"val_recon={val_recon:.4f} val_stft={val_stft:.4f} val_vq={val_vq:.4f} "
-            f"warmup={'on' if use_residual_warmup else 'off'}"
+            f"val_mae={val_recon:.4f} val_mse={val_mse:.4f} "
+            f"val_stft={val_stft:.4f} val_vq={val_vq:.4f} "
+            f"warmup={'decoder' if use_decoder_warmup else ('residual' if use_residual_warmup else 'off')}"
         )
 
         save_audio_tokenizer_bundle(args.out_dir, model, config)
         torch.save(model.state_dict(), os.path.join(args.out_dir, f"tokenizer_epoch_{epoch + 1:03d}.pt"))
 
-        score = (args.recon_weight * val_recon) + (args.vq_weight * val_vq) + (args.stft_weight * val_stft)
-        if score < best_score:
-            best_score = score
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
             torch.save(model.state_dict(), os.path.join(args.out_dir, "best_audio_tokenizer.pt"))
-            print(f"Saved best tokenizer to {os.path.join(args.out_dir, 'best_audio_tokenizer.pt')}")
+            print(
+                f"Saved best tokenizer (val_mse={val_mse:.6f}) to "
+                f"{os.path.join(args.out_dir, 'best_audio_tokenizer.pt')}"
+            )
 
     print(f"Tokenizer artifacts written to {args.out_dir}")
 
