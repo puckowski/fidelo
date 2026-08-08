@@ -1,4 +1,4 @@
-const state = { jobs: [], activeJobId: null, jobSockets: new Map(), waveformToken: 0 };
+const state = { jobs: [], activeJobId: null, jobSockets: new Map(), waveformToken: 0, waveformFrame: null };
 const byId = (id) => document.getElementById(id);
 const form = byId("generation-form");
 const promptInput = byId("prompt");
@@ -165,7 +165,8 @@ function showJob(job) {
     download.classList.add("hidden");
     byId("render-message").textContent = job.status === "failed" ? "Generation failed" : job.status === "running" ? "Building your track" : "Waiting for a GPU";
     byId("render-detail").textContent = job.status === "running" ? "MODEL INFERENCE IN PROGRESS" : job.status.toUpperCase();
-    drawIdleWaveform(job.seed);
+    if (["queued", "running"].includes(job.status)) drawGeneratingWaveform(job.seed);
+    else drawIdleWaveform(job.seed);
   }
 }
 
@@ -209,7 +210,14 @@ function drawBars(values) {
   });
 }
 
+function stopWaveformAnimation() {
+  state.waveformToken += 1;
+  if (state.waveformFrame !== null) cancelAnimationFrame(state.waveformFrame);
+  state.waveformFrame = null;
+}
+
 function drawIdleWaveform(seed = 17) {
+  stopWaveformAnimation();
   let value = Number(seed) || 17;
   const bars = Array.from({ length: 76 }, (_, index) => {
     value = (value * 16807) % 2147483647;
@@ -218,8 +226,31 @@ function drawIdleWaveform(seed = 17) {
   drawBars(bars);
 }
 
+function drawGeneratingWaveform(seed = 17) {
+  stopWaveformAnimation();
+  const token = state.waveformToken;
+  const seedPhase = ((Number(seed) || 17) % 997) / 997 * Math.PI * 2;
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const draw = (time = 0) => {
+    if (token !== state.waveformToken) return;
+    const bars = Array.from({ length: 76 }, (_, index) => {
+      const position = index / 75;
+      const envelope = .48 + .52 * Math.sin(position * Math.PI) ** 2;
+      const slowWave = Math.sin(index * .24 - time * .0022 + seedPhase);
+      const fastWave = Math.sin(index * .61 + time * .0034 + seedPhase * .7);
+      return .1 + Math.abs(slowWave * .68 + fastWave * .32) * .72 * envelope;
+    });
+    drawBars(bars);
+    if (!reducedMotion) state.waveformFrame = requestAnimationFrame(draw);
+  };
+
+  draw();
+}
+
 async function drawAudioWaveform(url) {
-  const token = ++state.waveformToken;
+  stopWaveformAnimation();
+  const token = state.waveformToken;
   try {
     const response = await fetch(url);
     const data = await response.arrayBuffer();
@@ -250,8 +281,9 @@ function escapeHtml(value) {
 byId("refresh-button").addEventListener("click", loadJobs);
 window.addEventListener("resize", () => {
   const job = state.jobs.find((item) => item.id === state.activeJobId);
-  drawIdleWaveform(job?.seed);
-  if (job?.audio_url) drawAudioWaveform(job.audio_url);
+  if (["queued", "running"].includes(job?.status)) drawGeneratingWaveform(job.seed);
+  else if (job?.audio_url) drawAudioWaveform(job.audio_url);
+  else drawIdleWaveform(job?.seed);
 });
 
 drawIdleWaveform();
